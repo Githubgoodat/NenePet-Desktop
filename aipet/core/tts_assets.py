@@ -1,0 +1,363 @@
+﻿"""Shared GPT-SoVITS asset discovery and validation."""
+
+from __future__ import annotations
+
+from contextlib import ExitStack
+
+from dataclasses import dataclass
+from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
+
+import requests
+
+from aipet.core.config import get_model_dir
+from aipet.core.network import is_loopback_url
+from aipet.core.runtime_logging import get_logger
+from aipet.core.voice_profile import VoiceProfile, VoiceProfileError, load_voice_profile
+
+
+GPT_WEIGHT_NAME = "murasame-gpt.ckpt"
+SOVITS_WEIGHT_NAME = "murasame-sovits.pth"
+MIN_GPT_WEIGHT_SIZE = 100_000_000
+MIN_SOVITS_WEIGHT_SIZE = 50_000_000
+logger = get_logger("tts-assets")
+
+
+def managed_tts_model_dir() -> Path:
+    return (
+        get_model_dir()
+        / "tts"
+        / "Murasame_SoVITS"
+    )
+
+
+def managed_gpt_sovits_dir() -> Path:
+    return get_model_dir() / "tts" / "GPT-SoVITS"
+
+
+@dataclass(frozen=True)
+class TTSAssetState:
+    engine_root: Path | None
+    engine_ready: bool
+    gpt_weight: Path | None
+    sovits_weight: Path | None
+    reference_root: Path | None
+    reference_voices_ready: bool
+    voice_profile: VoiceProfile | None = None
+
+    @property
+    def model_ready(self) -> bool:
+        return self.gpt_weight is not None and self.sovits_weight is not None
+
+    @property
+    def model_directory(self) -> Path | None:
+        if not self.model_ready:
+            return None
+        if self.gpt_weight.parent == self.sovits_weight.parent:
+            return self.gpt_weight.parent
+        return None
+
+
+@dataclass(frozen=True)
+class TTSHealthCheck:
+    reachable: bool
+    detail: str
+    status_code: int | None = None
+
+
+def locate_tts_assets(
+    *,
+    configured_engine_root: str = "",
+    configured_model_dir: str = "",
+    configured_voice_profile: str = "",
+) -> TTSAssetState:
+    engine_root = locate_gpt_sovits_root(configured_engine_root)
+    if configured_voice_profile.strip():
+        if engine_root is None:
+            raise VoiceProfileError("语音配置需要明确可用的 GPT-SoVITS 引擎目录")
+        profile = load_voice_profile(configured_voice_profile, engine_root)
+        return TTSAssetState(
+            engine_root=engine_root,
+            engine_ready=_engine_assets_are_ready(engine_root, profile.version),
+            gpt_weight=profile.gpt_weight,
+            sovits_weight=profile.sovits_weight,
+            reference_root=profile.manifest_path.parent,
+            reference_voices_ready=bool(profile.references) or profile.baseline_reference is not None,
+            voice_profile=profile,
+        )
+    gpt_weight, sovits_weight = locate_murasame_weights(
+        configured_model_dir=configured_model_dir,
+    )
+    reference_root = locate_reference_voices(configured_model_dir)
+    return TTSAssetState(
+        engine_root=engine_root,
+        engine_ready=_engine_assets_are_ready(engine_root),
+        gpt_weight=gpt_weight,
+        sovits_weight=sovits_weight,
+        reference_root=reference_root,
+        reference_voices_ready=reference_root is not None,
+    )
+
+
+def locate_gpt_sovits_root(configured: str = "") -> Path | None:
+    candidate = (
+        Path(configured).expanduser()
+        if configured.strip()
+        else managed_gpt_sovits_dir()
+    )
+    try:
+        resolved = candidate.resolve()
+    except OSError:
+        return None
+    if (resolved / "api_v2.py").is_file():
+        return resolved
+    return None
+
+
+def locate_murasame_weights(
+    *,
+    configured_model_dir: str = "",
+) -> tuple[Path | None, Path | None]:
+    directory = (
+        Path(configured_model_dir).expanduser()
+        if configured_model_dir.strip()
+        else managed_tts_model_dir()
+    )
+    return (
+        _valid_weight(directory / GPT_WEIGHT_NAME, MIN_GPT_WEIGHT_SIZE),
+        _valid_weight(
+            directory / SOVITS_WEIGHT_NAME,
+            MIN_SOVITS_WEIGHT_SIZE,
+        ),
+    )
+
+
+def probe_tts_service(
+    base_url: str,
+    timeout: float = 1.0,
+) -> TTSHealthCheck:
+    """Inspect whether *base_url* exposes a verifiable POST TTS API.
+
+    A generic 4xx response only proves that a TCP/HTTP server owns the port.
+    It does not prove that the service is GPT-SoVITS-compatible or healthy.
+    """
+
+    parsed = urlsplit(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return TTSHealthCheck(False, "TTS 地址无效")
+    with ExitStack() as cleanup:
+        session = requests.Session()
+        cleanup.callback(session.close)
+        if is_loopback_url(base_url):
+            session.trust_env = False
+        endpoint_path = parsed.path.rstrip("/") or "/tts"
+        schema_url = urlunsplit(
+            (parsed.scheme, parsed.netloc, "/openapi.json", "", "")
+        )
+        try:
+            response = session.get(
+                schema_url,
+                timeout=(timeout, timeout),
+            )
+        except requests.RequestException as exc:
+            return TTSHealthCheck(
+                False,
+                (
+                    f"GET {schema_url} 连接失败："
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            )
+
+        cleanup.callback(response.close)
+        if response.status_code != 200:
+            return TTSHealthCheck(
+                False,
+                f"GET {schema_url} 返回 HTTP {response.status_code}",
+                response.status_code,
+            )
+
+        try:
+            payload = response.json()
+        except (ValueError, AttributeError) as exc:
+            return TTSHealthCheck(
+                False,
+                (
+                    f"GET {schema_url} 未返回有效 OpenAPI JSON："
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                response.status_code,
+            )
+
+        paths = payload.get("paths", {}) if isinstance(payload, dict) else {}
+        tts_path = paths.get(endpoint_path) if isinstance(paths, dict) else None
+        if not isinstance(tts_path, dict) or "post" not in tts_path:
+            return TTSHealthCheck(
+                False,
+                (
+                    f"GET {schema_url} 的 OpenAPI 未声明 "
+                    f"POST {endpoint_path}"
+                ),
+                response.status_code,
+            )
+        return TTSHealthCheck(
+            True,
+            f"OpenAPI 已确认 POST {endpoint_path}",
+            response.status_code,
+        )
+
+
+def tts_service_is_reachable(base_url: str, timeout: float = 1.0) -> bool:
+    return probe_tts_service(base_url, timeout).reachable
+
+
+def configure_local_tts_weights(
+    base_url: str,
+    state: TTSAssetState,
+    timeout_seconds: int,
+) -> None:
+    if state.voice_profile is not None:
+        raise VoiceProfileError("角色 profile 仅能通过独立引擎配置加载，禁止远程切换其权重")
+    if is_loopback_url(base_url) and urlsplit(base_url).port == 9881:
+        raise VoiceProfileError("9881 为角色 profile 保留端口，禁止切换默认丛雨权重")
+    if not is_loopback_url(base_url) or not state.model_ready:
+        return
+    root = base_url.rstrip("/")
+    if root.endswith("/tts"):
+        root = root[:-4]
+    with ExitStack() as cleanup:
+        session = requests.Session()
+        cleanup.callback(session.close)
+        session.trust_env = False
+        for endpoint, path in (
+            ("set_gpt_weights", state.gpt_weight),
+            ("set_sovits_weights", state.sovits_weight),
+        ):
+            url = f"{root}/{endpoint}"
+            try:
+                response = session.get(
+                    url,
+                    params={"weights_path": str(path.resolve())},
+                    timeout=(5, timeout_seconds),
+                )
+                cleanup.callback(response.close)
+                response.raise_for_status()
+            except requests.RequestException as exc:
+                response = getattr(exc, "response", None)
+                if response is None:
+                    logger.warning(
+                        "TTS 权重加载连接失败 | GET %s | %s: %s",
+                        url,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    raise
+                logger.warning(
+                    "TTS 权重加载请求失败 | GET %s | HTTP %s | "
+                    "Content-Type=%s | 响应=%s",
+                    url,
+                    response.status_code,
+                    response.headers.get("Content-Type", ""),
+                    _response_text_summary(response),
+                )
+                raise
+            logger.info(
+                "TTS 权重加载完成 | %s | HTTP %s | 权重=%s",
+                endpoint,
+                response.status_code,
+                path,
+            )
+
+
+def _response_text_summary(
+    response: requests.Response,
+    limit: int = 2_000,
+) -> str:
+    content_type = response.headers.get("Content-Type", "")
+    if content_type.lower().startswith("audio/"):
+        return f"<音频响应已省略，{len(response.content)} 字节>"
+    try:
+        text = " ".join(response.text.split())
+    except Exception:
+        return "<响应正文无法解码>"
+    if not text:
+        return "<空响应>"
+    if len(text) > limit:
+        return text[:limit] + f"…<已截断 {len(text) - limit} 字符>"
+    return text
+
+
+def _valid_weight(path: Path, minimum_size: int) -> Path | None:
+    try:
+        if path.is_file() and path.stat().st_size >= minimum_size:
+            return path.resolve()
+    except OSError:
+        pass
+    return None
+
+
+def locate_reference_voices(configured_model_dir: str = "") -> Path | None:
+    model_directory = (
+        Path(configured_model_dir).expanduser()
+        if configured_model_dir.strip()
+        else managed_tts_model_dir()
+    )
+    root = model_directory / "reference_voices"
+    if _reference_voices_are_ready(root):
+        return root.resolve()
+    return None
+
+
+def _reference_voices_are_ready(root: Path) -> bool:
+    for emotion in ("平静", "高兴", "害羞", "生气", "惊讶", "着急"):
+        directory = root / emotion
+        if not (directory / "asr.txt").is_file():
+            return False
+        try:
+            if not any(
+                item.suffix.lower() in {".wav", ".mp3", ".flac"}
+                for item in directory.iterdir()
+            ):
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def _engine_assets_are_ready(
+    engine_root: Path | None,
+    profile_version: str | None = None,
+) -> bool:
+    if engine_root is None:
+        return False
+    required = (
+        "api_v2.py",
+        (
+            "GPT_SoVITS/pretrained_models/"
+            "chinese-roberta-wwm-ext-large/pytorch_model.bin"
+        ),
+        (
+            "GPT_SoVITS/pretrained_models/"
+            "chinese-hubert-base/pytorch_model.bin"
+        ),
+    )
+    if profile_version is None:
+        required += ("GPT_SoVITS/configs/tts_infer.yaml",)
+    if profile_version in {None, "v4"}:
+        required += ((
+            "GPT_SoVITS/pretrained_models/"
+            "gsv-v4-pretrained/vocoder.pth"
+        ),)
+    elif profile_version in {"v2Pro", "v2ProPlus"}:
+        required += ((
+            "GPT_SoVITS/pretrained_models/sv/"
+            "pretrained_eres2netv2w24s4ep4.ckpt"
+        ),)
+    elif profile_version == "v3":
+        required += (
+            "GPT_SoVITS/pretrained_models/"
+            "models--nvidia--bigvgan_v2_24khz_100band_256x/config.json",
+            "GPT_SoVITS/pretrained_models/"
+            "models--nvidia--bigvgan_v2_24khz_100band_256x/bigvgan_generator.pt",
+        )
+    return all((engine_root / relative).is_file() for relative in required)
+

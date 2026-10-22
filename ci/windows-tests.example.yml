@@ -1,0 +1,39 @@
+name: Offline source tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-python:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONUTF8: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      DEEPSEEK_API_KEY: ""
+      DASHSCOPE_API_KEY: ""
+      OPENAI_API_KEY: ""
+    steps:
+      # Major versions verified against both actions' official README examples.
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          architecture: x64
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-reading.txt
+            tests/requirements-ci.txt
+      - name: Install test dependencies
+        run: python -m pip install -r tests/requirements-ci.txt
+      - name: Run isolated tests without live APIs or assets
+        run: python tests/run_offline.py

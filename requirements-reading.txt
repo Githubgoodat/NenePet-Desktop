@@ -1,0 +1,3 @@
+# Optional document reader, installed locally with:
+# python -m pip install --no-deps --target vendor/reading -r requirements-reading.txt
+pypdf==6.21.2
