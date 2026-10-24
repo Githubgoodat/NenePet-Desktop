@@ -35,6 +35,14 @@ class UISmokeTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
 
+    def setUp(self) -> None:
+        # These are widget tests, not PortAudio/device integration tests.
+        # Device-selection cases override this default with synthetic devices.
+        self.enterContext(patch(
+            "aipet.ui.settings_dialog.refresh_audio_input_devices",
+            return_value=(None, []),
+        ))
+
     @unittest.skip('Private upstream portrait layers are deliberately not distributed; no visual-rendering acceptance is claimed.')
     def test_status_text_can_use_the_user_name(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

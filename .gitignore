@@ -51,6 +51,9 @@ releases/
 *.spec
 *.egg-info/
 .pytest_cache/
+.doctor-test-temp/
+.workflow-test-temp/
+.offline-test-temp/
 .mypy_cache/
 .ruff_cache/
 .coverage*

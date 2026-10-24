@@ -2,6 +2,10 @@
 
 基于 [AIpet-Murasame](https://github.com/kuxiaowo/AIpet-Murasame) 改造的 Windows 桌面角色陪伴程序。它通过 Live2DViewerEX 显示人物，通过用户自己的对话 API 生成回答；可选的 GPT-SoVITS 独立进程负责日语语音。
 
+**代码基础与灵感来源：** [kuxiaowo/AIpet-Murasame](https://github.com/kuxiaowo/AIpet-Murasame)。本项目直接沿用并修改其源码与交互架构，感谢上游作者及贡献者；不是从零独立实现。
+
+**Live2D 模型作者：** [07nene](https://steamcommunity.com/profiles/76561199513188793/myworkshopfiles?appid=616720)，作品[《宁宁live2d》](https://steamcommunity.com/sharedfiles/filedetails/?id=3578664864)。本地使用的可编辑工程和运行模型由这份模型恢复、适配而来，原模型作者署名保留。模型本体及工程未在本仓库公开。完整来源与许可边界见 [CREDITS.md](CREDITS.md)。
+
 **这是源码仓库，不是开箱即用的角色整合包。** 本仓库不包含游戏立绘、Live2D 模型、游戏截图、参考语音、模型权重、GPT-SoVITS 运行环境或 Live2DViewerEX。下载源码后，需要先按 [本地素材说明](docs/LOCAL_ASSETS.md) 配置有权使用的素材及外部程序，才能显示完整桌宠。只需文字对话时，可以关闭 TTS，但仍须配置角色显示所需的模型和 Viewer。
 
 ## 包含的功能
@@ -11,6 +15,8 @@
 - `Ctrl+Alt+N` 随手问：明确触发后读取复制的文字，进行解释、翻译或提炼。
 - 共同阅读 TXT、Markdown 和 PDF，可查看回答引用的原文片段。PDF 导入只读取文字层；扫描页可按需使用“框选屏幕”或“识别剪贴板图片”，需单独配置可用的视觉模型，并核对识别结果。
 - 文字优先、停止、重试、复制与按需朗读；免打扰暂停互动。
+- AI 任务跟进面板：接收 Codex 生命周期事件，以及 Grok Bot 显式协作上报，区分运行、需要输入、阶段结束和中断。两种来源都要先接入，不能把代码存在当成已连接；见 [工作流说明](docs/WORKFLOW.md)。
+- 可选微信直连提醒：扫码绑定后向本人发送固定任务状态，不经公众号、不调用额外对话模型。需要本人先发消息建立上下文，并实测手机是否收到。
 - 用户自行选择对话服务及 API Key。服务可用性、模型回复质量和费用取决于对应服务商及自己的账号。
 
 宁宁人格是同人预设，不代表游戏原作、作者或配音演员背书。预设以已经较亲密的关系开始，可在本地修改 `prompt.nene.txt`。没有本地场景证据时，系统不会假称已从游戏截图检索到依据；角色一致性仍受提示词、上下文和模型能力影响。
@@ -25,6 +31,24 @@
 py -3.13 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt -r requirements-reading.txt "pynput>=1.7,<2" "Pillow>=12,<13" "sounddevice>=0.5,<1"
 ```
+
+### 启动前诊断（源码模式）
+
+先运行只依赖 Python 标准库的准备检查；尚未装齐 Qt 等依赖时也能输出缺项：
+
+```powershell
+.\.venv\Scripts\python.exe packaging/share_main.py --doctor
+```
+
+`required` 表示需要准备的项目，`optional` 表示按功能准备的项目。刚克隆时缺少未公开的 Live2D 模型会列为阻断项，退出码为 `2`；缺少场景证据、语音配置或 PDF 等可选组件不会单独导致失败。依赖检查只读取安装元数据，模型检查只核对 JSON 与声明文件，不能据此确认版本兼容、DLL、画面、点击、API 或音色正常。
+
+默认只输出 JSON，不读取用户配置、聊天或密钥，不触网、不启动 Viewer、语音或窗口。可显式检查自己的 Viewer 目录，并写入已有普通目录中的一个新报告：
+
+```powershell
+.\.venv\Scripts\python.exe packaging/share_main.py --doctor --viewer-root 'D:\SteamLibrary\steamapps\common\Live2DViewerEX' --report .\doctor-report.json
+```
+
+上例路径应换成自己的安装目录。报告不包含绝对安装路径或凭据；不会覆盖已有文件，也不允许写进配置、素材或引擎目录。未传 `--viewer-root` 时，Viewer 标为尚未检查，不自动扫描安装或读取设置。此诊断只支持源码模式，不替代完整资源包的 `--share-self-test` 或实机验收。
 
 然后完成以下准备：
 

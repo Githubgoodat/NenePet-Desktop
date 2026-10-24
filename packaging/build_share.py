@@ -49,17 +49,25 @@ def create_source(destination: Path) -> None:
         copy(path.relative_to(REPO).as_posix(), destination)
     for relative in (
         "LICENSE", "UPSTREAM_COMMIT.txt", "requirements.txt", "requirements-reading.txt",
-        "requirements-voice.txt", "prompt.txt", "prompt.en.txt", "prompt.nene.txt",
+        "requirements-voice.txt", "requirements-weixin.txt", "prompt.txt", "prompt.en.txt", "prompt.nene.txt",
         "思源黑体Bold.otf", "packaging/share_main.py", "packaging/share_support.py",
-        "packaging/share_voice_check.py",
+        "packaging/share_voice_check.py", "packaging/share_doctor.py",
         "packaging/build_share.py", "packaging/collect_share_licenses.py",
         "packaging/build_voice_bundle.py",
-        "README.md", "docs/LOCAL_ASSETS.md", ".gitignore",
+        "README.md", "CREDITS.md", "docs/LOCAL_ASSETS.md", ".gitignore",
+        "docs/WORKFLOW.md", "tools/nene_workflow_hook.py", "tools/nene_workflow_event.py",
+        "tools/prepare_codex_workflow.py",
+        "licenses/font/LICENSE-Apache-2.0.txt", "licenses/font/font-name-table.json",
+        "licenses/weixin/LICENSE-Tencent-MIT.txt",
         "tests/__init__.py", "tests/test_share_support.py",
     ):
         copy(relative, destination)
     for path in sorted((REPO / "assets/motions").glob("*.motion3.json")):
         copy(path.relative_to(REPO).as_posix(), destination)
+    for path in sorted((REPO / "tests").rglob("*.py")):
+        copy(path.relative_to(REPO).as_posix(), destination)
+    for relative in ("tests/README.md", "tests/requirements-ci.txt"):
+        copy(relative, destination)
     for name in MODEL_FILES:
         copy("assets/models/nene-editable/" + name, destination)
     for extension in ("wav", "txt"):
@@ -120,6 +128,14 @@ def build(source: Path, output: Path) -> None:
         import importlib.util
         if importlib.util.find_spec("pypdf") is None:
             raise RuntimeError("Install requirements-reading.txt into the build Python before freezing.")
+    # QR setup is optional; without it the normal pet and local task panel work.
+    qr_vendor = REPO / "vendor/weixin"
+    if (qr_vendor / "qrcode").is_dir():
+        command.extend(("--paths", str(qr_vendor), "--hidden-import", "qrcode"))
+    else:
+        import importlib.util
+        if importlib.util.find_spec("qrcode") is not None:
+            command.extend(("--hidden-import", "qrcode"))
     for module in EXCLUDES:
         command.extend(("--exclude-module", module))
     command.append(str(source / "packaging/share_main.py"))
@@ -180,6 +196,10 @@ def main() -> int:
     if args.build:
         build(source, output)
         package = output / "dist/NenePet"
+        for relative in ("CREDITS.md", "LICENSE", "UPSTREAM_COMMIT.txt"):
+            shutil.copy2(source / relative, package / relative)
+        shutil.copytree(source / "licenses/font", package / "licenses/font", dirs_exist_ok=True)
+        shutil.copytree(source / "licenses/weixin", package / "licenses/weixin", dirs_exist_ok=True)
         voice_profiles(package)
         archive_tree(source, package / "对应源码.zip", prefix="source")
     print(str(output), flush=True)

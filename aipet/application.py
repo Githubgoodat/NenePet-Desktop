@@ -418,11 +418,25 @@ def main() -> int:
     input_action = add_text_input_action(tray_menu, pet, settings)
     utility_action = QAction(tray_menu)
     utility_action.setVisible(settings.character.profile_id == "nene")
+    workflow_action = QAction(tray_menu)
+    workflow_action.setVisible(settings.character.profile_id == "nene")
     utility = utility_hotkey = None
+    workflow = None
+    workflow_weixin = None
     if settings.character.profile_id == "nene":
         from aipet.ui.utility_assistant import UtilityController
         from aipet.ui.utility_hotkey import UtilityHotkey
+        from aipet.ui.workflow_assistant import WorkflowController
+        from aipet.ui.weixin_notify import WeixinNotifyController
         utility = UtilityController(pet, parent=app)
+        workflow = WorkflowController(pet, parent=app)
+        workflow_weixin = WeixinNotifyController(pet, parent=app)
+        workflow.notification_ready.connect(workflow_weixin.enqueue)
+        workflow.tracking_changed.connect(workflow_weixin.set_tracking)
+        workflow.dialog.weixin.clicked.connect(workflow_weixin.open)
+        workflow_weixin.status_changed.connect(workflow.dialog.weixin_status.setText)
+        workflow.dialog.weixin_status.setText(workflow_weixin.status_text)
+        workflow_action.triggered.connect(lambda: workflow.open())
         utility_hotkey = UtilityHotkey(parent=app)
         utility_action.triggered.connect(lambda: utility.open())
         utility_hotkey.activated.connect(lambda: utility.open(clipboard=True))
@@ -438,6 +452,8 @@ def main() -> int:
         utility_action.setText(("Ask / Read together…" if current_settings.ui_language == "en"
                                else "随手问与共同阅读…") + shortcut_hint)
         utility_action.setVisible(current_settings.character.profile_id == "nene")
+        workflow_action.setText("AI task tracking…" if current_settings.ui_language == "en" else "AI任务跟进…")
+        workflow_action.setVisible(current_settings.character.profile_id == "nene")
         settings_action.setText(ui_text(current_settings, "settings"))
         dnd_action.setText(ui_text(current_settings, "dnd"))
         screenshot_action.setText(ui_text(current_settings, "vision"))
@@ -450,6 +466,7 @@ def main() -> int:
     apply_tray_language(settings)
 
     tray_menu.addAction(utility_action)
+    tray_menu.addAction(workflow_action)
     tray_menu.addAction(settings_action)
     tray_menu.addSeparator()
     tray_menu.addAction(dnd_action)
@@ -663,6 +680,10 @@ def main() -> int:
             utility_hotkey.stop()
         if utility is not None:
             utility.shutdown()
+        if workflow is not None:
+            workflow.shutdown()
+        if workflow_weixin is not None:
+            workflow_weixin.shutdown()
         tray_icon.hide()
         tray_menu.setEnabled(False)
         pet.begin_shutdown()
@@ -698,6 +719,10 @@ def main() -> int:
     exit_action.triggered.connect(coordinator.request)
     if utility is not None and "--nene-open-tools" in sys.argv:
         QTimer.singleShot(0, lambda: utility.open())
+    if workflow is not None and "--nene-open-workflow" in sys.argv:
+        QTimer.singleShot(0, workflow.open)
+    if workflow_weixin is not None and "--nene-open-weixin" in sys.argv:
+        QTimer.singleShot(0, workflow_weixin.open)
     if "--nene-smoke-ui" in sys.argv:
         pet.show_text("点击人物输入，回车发送。", typing=False)
         QTimer.singleShot(60_000, coordinator.request)

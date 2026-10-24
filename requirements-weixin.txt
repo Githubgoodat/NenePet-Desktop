@@ -1,0 +1,2 @@
+# Optional local QR encoder for the direct Weixin notification setup.
+qrcode==8.2

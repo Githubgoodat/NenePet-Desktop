@@ -203,6 +203,8 @@ def _ui_smoke(base: Path, resources: Path, report_path: str | None) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--doctor", action="store_true", help="仅离线检查源码准备状态，不读取用户配置或启动程序")
+    parser.add_argument("--viewer-root", type=Path, help="仅与 --doctor 配合，检查显式指定的 Viewer 安装结构")
     parser.add_argument("--share-setup", action="store_true")
     parser.add_argument("--share-setup-child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--share-self-test", action="store_true")
@@ -212,6 +214,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--report")
     # Preserve the app's bundled log viewer special entry point.
     args, rest = parser.parse_known_args(argv)
+    if args.viewer_root is not None and not args.doctor:
+        parser.error("--viewer-root 只能与 --doctor 配合使用")
+    if args.doctor:
+        if (rest or args.share_setup or args.share_setup_child or args.share_self_test
+                or args.share_ui_smoke or args.share_voice_check or args.engine_root is not None):
+            parser.error("--doctor 只能与 --viewer-root 和 --report 配合使用")
+        from share_doctor import diagnose, write_report
+        base, resources = portable_roots()
+        try:
+            return write_report(diagnose(resources, base=base, viewer_root=args.viewer_root),
+                                Path(args.report) if args.report else None)
+        except (ValueError, OSError):
+            if sys.stderr is not None:
+                print("无法写入诊断报告：请使用已有普通目录内的新 .json 文件，并避开配置、素材与引擎目录。", file=sys.stderr)
+            return 2
     if args.share_setup_child and not args.share_setup:
         parser.error("内部设置参数只能用于首次设置")
     if args.share_voice_check and (not args.engine_root or not args.report):
