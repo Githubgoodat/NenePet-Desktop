@@ -16,9 +16,11 @@ spec.loader.exec_module(setup)
 
 
 class WorkflowSetupTests(unittest.TestCase):
-    def test_windows_paths_with_spaces_are_quoted_and_control_characters_rejected(self):
-        self.assertEqual('"C:/Program Files/Python/python.exe" "script.py"',
+    def test_windows_powershell_invokes_executable_and_preserves_literal_arguments(self):
+        self.assertEqual("& 'C:/Program Files/Python/python.exe' 'script.py'",
                          setup._windows_command(["C:/Program Files/Python/python.exe", "script.py"]))
+        self.assertEqual("& 'C:/O''Brien/$profile; & literal.py'",
+                         setup._windows_command(["C:/O'Brien/$profile; & literal.py"]))
         for bad in ('percent%PATH%', 'quoted"path', 'line\npath', 'bang!path', 'nul\0path'):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 setup._windows_command([bad])
@@ -36,7 +38,8 @@ class WorkflowSetupTests(unittest.TestCase):
             for groups in hooks["hooks"].values():
                 handler = groups[0]["hooks"][0]
                 self.assertEqual({"type", "command", "timeout"}, set(handler))
-                self.assertIn('"--inbox"', handler["command"])
+                self.assertTrue(handler["command"].startswith("& '"))
+                self.assertIn("'--inbox'", handler["command"])
                 self.assertEqual(3, handler["timeout"])
             self.assertFalse(inbox.exists())
             self.assertNotIn("permissionDecision", json.dumps(hooks))

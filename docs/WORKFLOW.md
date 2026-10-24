@@ -14,6 +14,8 @@ Codex 桥接使用[官方生命周期 hooks](https://learn.chatgpt.com/docs/hook
 | Interrupt | 本轮被中断 |
 | SessionEnd | 会话结束；不代表工作成功 |
 
+`PermissionRequest` 是请求操作批准，例如命令提权或网络访问确认，不代表所有澄清提问。当前版本尚未覆盖 `request_user_input` 等输入工具或异步提问；异步提问后任务还可能继续运行，不能据此判为暂停。助手只在回答文本中提出问题时，也无法仅凭这些元数据判断是否在等待回复。工具 hook 通常提供 `tool_name`，但部分专用工具路径可能不触发，覆盖范围须逐项验收，见[官方工具覆盖说明](https://learn.chatgpt.com/docs/hooks#tool-coverage)。
+
 超过十分钟没有新事件时，显示状态已经过期，需回来源确认。长时间运行也可能只是一个工具尚未返回；不会把沉默判成失败。开始跟进时已有事件只作基线，不集中弹出旧通知。免打扰暂停扫描和提示，恢复后重新建立基线，不补播积压通知。任务面板不自动朗读或调用对话模型。
 
 Grok Bot 通过显式协作上报接入，尚无事件时显示“未连接或尚无协作上报”。本项目没有改动 Grok Bot 安装包，也没有订阅其内部 Electron 状态，或读取它的登录令牌、对话数据库。
@@ -31,11 +33,35 @@ Grok Bot 通过显式协作上报接入，尚无事件时显示“未连接或�
 
 生成器将当前 Python 与观察脚本的绝对路径写入待审阅文件。移动源码或虚拟环境后要重新生成。它只创建新文件，拒绝覆盖，不修改 Codex 配置或信任设置。
 
+Windows 生成的命令面向 PowerShell，使用调用运算符 `&` 和单引号参数；若手工配置其他执行 shell，须按该 shell 的规则适配并验收。旧版 Windows 配置使用了仅将程序和参数用双引号相连的 cmd 风格命令，在 PowerShell 中可能直接解析失败。已有此类配置时，请用当前生成器输出到新文件，替换原有宁宁观察器定义并保留其他 hooks，再到 `/hooks` 审阅并信任修改后的定义；旧定义的信任不会自动覆盖新命令。
+
 3. 将生成的 `hooks` 定义合并到自己的 `~/.codex/hooks.json`，或需要跟进的项目 `.codex/hooks.json`。已有 hooks 必须保留：各事件下的处理器是数组，应追加本观察器，不能替换其他工具的定义。项目级定义只适用于该配置层生效的项目。
 4. 根据[官方信任流程](https://learn.chatgpt.com/docs/hooks#review-and-trust-hooks)，在 Codex CLI 中打开 `/hooks`，审阅并信任这份准确的定义。未信任、定义变更或版本不支持时，Codex 可能跳过它；“文件已生成”不等于“已连接”。不要通过关闭信任检查来安装。
 5. 在需要跟进的 Codex 会话中进行一次普通交互，核对面板是否出现对应项目、事件和时间。真实事件抵达之前，面板保持“尚未连接或尚无事件”。桌面版对这些事件的实际支持仍需要当机验收。
 
 观察脚本只输出空成功结果，不提供允许、拒绝、阻断或上下文指令；无法写入时也不会接管 Codex 的审批流程。它不启动服务，不读取账号令牌。
+
+### Windows CLI 启动提示
+
+从桌面应用的 PATH 入口启动 `codex` 时，如果提示 `TERM is set to "dumb"`，可以在供你交互的 PowerShell 窗口清除这个继承值。如果随后报 `this CLI has no complete local package`，可先尝试独立交互模式：
+
+```powershell
+Remove-Item Env:TERM -ErrorAction SilentlyContinue
+codex --no-daemon --no-alt-screen
+```
+
+清除 `TERM` 只影响当前窗口及其后续子进程，不改系统环境变量。根据[官方 CLI 参数说明](https://learn.chatgpt.com/docs/cli/reference)，`--no-daemon` 避开共享后台服务器，`--no-alt-screen` 保留终端滚屏；它们不绕过 hook 信任。启动后仍需输入 `/hooks`，亲自审阅并信任观察器。
+
+此方式已在一台出现上述缺包报错的 Windows 电脑上进入 hook 审阅界面，因此遇到相同提示时不必先更新或重装。它不保证所有缺包或损坏情况都能启动；若仍失败，应根据新的错误检查官方完整安装，不能将启动成功当作提醒已接通。
+
+可在 Windows 中单独验收生成命令的原生 PowerShell 执行。先在源码目录创建临时父目录，再传入其绝对路径：
+
+```powershell
+New-Item -ItemType Directory -Path .\shell-check-scratch
+.\.venv\Scripts\python.exe tests/check_workflow_shell_windows.py --scratch-root (Resolve-Path .\shell-check-scratch).Path
+```
+
+此脚本只在指定父目录中新建并清理随机子目录，用真实观察脚本写合成收件目录，核对空 JSON 输出、敏感占位内容排除及特殊字符参数保持原样。它不读取真实配置或收件目录，不联网；由于会启动本机 PowerShell 子进程，需单独运行，不属于禁止子进程的 `tests/run_offline.py` 测试集。失败返回非零，不以跳过表示通过。
 
 ## Grok Bot 协作上报
 

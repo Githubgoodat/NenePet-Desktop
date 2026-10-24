@@ -12,11 +12,13 @@ EVENTS = ("UserPromptSubmit", "PreToolUse", "PermissionRequest", "Stop", "Interr
 
 
 def _windows_command(arguments: list[str]) -> str:
-    # Commands may run through cmd.exe. Quoting alone does not stop percent
-    # expansion; reject it rather than generate an ambiguous shell command.
+    # Codex uses the selected shell. This Windows generator targets PowerShell:
+    # a quoted executable needs '&', and single-quoted arguments stay literal.
+    # Keep rejecting previously unsupported characters; other Windows shells
+    # require their own reviewed command definition.
     if any(any(c in value for c in '\"%!\r\n\x00') for value in arguments):
         raise ValueError("Windows hook paths contain unsupported shell characters")
-    return " ".join('"' + value + '"' for value in arguments)
+    return "& " + " ".join("'" + value.replace("'", "''") + "'" for value in arguments)
 
 
 def prepare_hooks(python: Path, script: Path, inbox: Path) -> dict:
