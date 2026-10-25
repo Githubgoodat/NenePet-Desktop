@@ -89,7 +89,7 @@ class BarkDialog(QDialog):
         self.info = QLabel(
             "在本人的 iPhone 安装 Bark 并允许通知后，填写它提供的设备密钥或地址。\n"
             "启用后，微信不可用或明确拒绝的任务提醒可交给 Bark 备用通道。\n"
-            "第三方推送服务会收到固定来源、状态和哈希任务短号；不含项目名、路径或聊天正文。"
+            "按你的选择，第三方推送服务会收到项目名、来源和状态；不含完整路径、任务编号或聊天正文。"
         )
         self.info.setTextFormat(Qt.PlainText)
         self.info.setWordWrap(True)
@@ -319,8 +319,9 @@ class BarkNotifyController(QObject):
                 return
             key = ("input", notice_id)
         else:
-            key = ("state", snapshot.source, snapshot.task_id, snapshot.turn_id,
-                   snapshot.status, snapshot.observed_at)
+            key = ("state", snapshot.source, snapshot.task_id, snapshot.turn_id, snapshot.status)
+            if snapshot.status not in {"turn_ended", "phase_ended", "interrupted", "failed"}:
+                key += (snapshot.observed_at,)
         if key in self._seen:
             return
         self._seen[key] = observed

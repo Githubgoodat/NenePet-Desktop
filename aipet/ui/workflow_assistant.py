@@ -5,7 +5,8 @@ The producer is installed separately. This reader never creates its inbox.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from dataclasses import dataclass, fields
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from PyQt5.QtCore import QObject, QTimer, Qt, pyqtSignal
@@ -16,7 +17,7 @@ from PyQt5.QtWidgets import (
 
 from aipet.core.config import get_cache_dir
 from aipet.core.workflow_events import load_snapshots
-from aipet.core.workflow_input_notices import load_input_notices
+from aipet.core.workflow_input_notices import InputNotice, load_input_notices
 
 
 _STATUS_TEXT = {
@@ -40,6 +41,22 @@ _INPUT_TEXT = {
     "input_requested": "发起输入请求，请回 Codex 查看。",
     "question_opened": "发起提问，任务可能仍在继续，请回 Codex 查看。",
 }
+_AUTHORIZATION_GRACE = timedelta(seconds=30)
+_MAX_PENDING_AUTHORIZATIONS = 128
+_TERMINAL_NOTICES = {"turn_ended", "phase_ended", "interrupted", "failed"}
+
+
+@dataclass(frozen=True)
+class InputNotification(InputNotice):
+    """Presentation-only context; never changes the durable question journal."""
+
+    authorization_observed: bool = False
+
+
+@dataclass(frozen=True)
+class _PendingAuthorization:
+    record: object
+    deadline: datetime
 
 
 def _utc_now() -> datetime:
@@ -149,6 +166,11 @@ class WorkflowController(QObject):
         self._input_notices = {}
         self._input_seen = {}
         self._input_seen_before = self._watch_started
+        self._pending_authorizations = {}
+        self._authorization_seen = {}
+        self._authorization_seen_before = self._watch_started
+        self._terminal_seen = {}
+        self._terminal_seen_before = self._watch_started
         self._last_tracking = None
         self.timer = QTimer(self)
         self.timer.setInterval(3_000)
@@ -188,13 +210,15 @@ class WorkflowController(QObject):
         if not self._sync_tracking():
             self._baseline_required = True
             self._input_baseline_required = True
+            self._pending_authorizations.clear()
             return
         now = self._clock()
         if self._baseline_required:
             self._watch_started = now
-        # Questions have their own durable channel. Consume them before
-        # lifecycle notices so a burst of turn endings cannot take their slots.
-        self._poll_inputs(now)
+            self._pending_authorizations.clear()
+        # Read questions first, but stage their emission until this poll's
+        # approval facts can be attached. They still precede ordinary endings.
+        inputs = self._poll_inputs(now)
         if not self._allowed():
             self._baseline_required = True
             self._render(now)
@@ -204,16 +228,30 @@ class WorkflowController(QObject):
         except (OSError, ValueError):
             self._read_error = True
             self._baseline_required = True
+            self._pending_authorizations.clear()
+            self._notify_inputs(inputs)
             self._render()
             return
         self._read_error = False
         current = {}
+        lifecycle = []
+        overflow = []
         for record in records:
             if record.source not in _SOURCE_TEXT or record.status not in _STATUS_TEXT:
                 continue
             observed = _observed(record)
             if observed is None or observed > now:
                 continue
+            eligible = (not self._baseline_required and observed > self._watch_started
+                        and record.status in _NOTICE_TEXT and not record.is_stale(now))
+            authorization = record.source == "codex" and record.event == "PermissionRequest"
+            # Approval observations are independent of the latest displayed
+            # turn. Subagents share a parent session, and their progress cannot
+            # establish that another invocation's approval was resolved.
+            if eligible and authorization:
+                displaced = self._remember_authorization(record, observed)
+                if displaced is not None:
+                    overflow.append(displaced)
             key = (record.source, record.task_id)
             previous = self._snapshots.get(key)
             # Do not turn a newer displayed state back into an older one if a
@@ -222,23 +260,82 @@ class WorkflowController(QObject):
                 current[key] = previous
                 continue
             current[key] = record
-            if (not self._baseline_required and observed > self._watch_started
-                    and record.status in _NOTICE_TEXT and not record.is_stale(now)):
-                self.pet.notification.emit(
-                    "宁宁 · AI任务跟进",
-                    _SOURCE_TEXT[record.source] + " · " + (_display(record.project) or "未命名项目") + "：" + _NOTICE_TEXT[record.status],
-                )
-                if self._allowed():
-                    self.notification_ready.emit(record)
+            if eligible and not authorization:
+                lifecycle.append(record)
         self._snapshots = current
         self._baseline_required = False
+        if self._input_read_error:
+            self._pending_authorizations.clear()
+            overflow.clear()
+        overflow = self._notify_inputs(inputs, overflow)
+        # Capacity pressure may shorten the grace period, but must not silently
+        # discard an observed approval. Each displaced fact is emitted once.
+        for pending in overflow:
+            self._notify_lifecycle(pending.record)
+        for record in lifecycle:
+            self._notify_lifecycle(record)
+        self._flush_authorizations(now)
         self._render(now)
+
+    def _remember_authorization(self, record, observed):
+        identity = (record.source, record.task_id, record.turn_id)
+        previous = self._authorization_seen.get(identity)
+        if (observed <= self._authorization_seen_before
+                or previous is not None and observed <= previous):
+            return None
+        self._authorization_seen[identity] = observed
+        while len(self._authorization_seen) > 256:
+            oldest = min(self._authorization_seen, key=lambda key: (self._authorization_seen[key], key))
+            self._authorization_seen_before = max(
+                self._authorization_seen_before, self._authorization_seen.pop(oldest))
+        pending = self._pending_authorizations.get(identity)
+        deadline = pending.deadline if pending is not None else observed + _AUTHORIZATION_GRACE
+        self._pending_authorizations[identity] = _PendingAuthorization(record, deadline)
+        if len(self._pending_authorizations) > _MAX_PENDING_AUTHORIZATIONS:
+            oldest = min(self._pending_authorizations,
+                         key=lambda key: (self._pending_authorizations[key].deadline, key))
+            return self._pending_authorizations.pop(oldest)
+        return None
+
+    def _notify_lifecycle(self, record):
+        if not self._allowed():
+            return
+        if record.status in _TERMINAL_NOTICES:
+            observed = _observed(record)
+            identity = (record.source, record.task_id, record.turn_id, record.status)
+            if identity in self._terminal_seen or observed <= self._terminal_seen_before:
+                return
+            self._terminal_seen[identity] = observed
+            while len(self._terminal_seen) > 256:
+                oldest = min(self._terminal_seen, key=lambda key: (self._terminal_seen[key], key))
+                self._terminal_seen_before = max(self._terminal_seen_before, self._terminal_seen.pop(oldest))
+        message = _NOTICE_TEXT[record.status]
+        if record.source == "codex" and record.event == "PermissionRequest":
+            message = "记录到授权请求，是否仍需处理请回 Codex 核对。"
+        self.pet.notification.emit(
+            "宁宁 · AI任务跟进",
+            _SOURCE_TEXT[record.source] + " · " + (_display(record.project) or "未命名项目") + "：" + message,
+        )
+        if self._allowed():
+            self.notification_ready.emit(record)
+
+    def _flush_authorizations(self, now):
+        if not self._allowed() or self._read_error or self._input_read_error:
+            self._pending_authorizations.clear()
+            return
+        for key, pending in tuple(self._pending_authorizations.items()):
+            record = pending.record
+            if record.is_stale(now):
+                self._pending_authorizations.pop(key, None)
+            elif now >= pending.deadline:
+                self._pending_authorizations.pop(key, None)
+                self._notify_lifecycle(record)
 
     def _poll_inputs(self, now):
         """Consume durable question facts independently of current task state."""
         if not self._allowed():
             self._input_baseline_required = True
-            return
+            return ()
         if self._input_baseline_required:
             self._input_watch_started = now
         try:
@@ -246,7 +343,7 @@ class WorkflowController(QObject):
         except (OSError, ValueError):
             self._input_read_error = True
             self._input_baseline_required = True
-            return
+            return ()
         self._input_read_error = False
         current = {}
         eligible = []
@@ -272,16 +369,40 @@ class WorkflowController(QObject):
             oldest = min(self._input_seen, key=lambda key: (self._input_seen[key], key))
             self._input_seen_before = max(self._input_seen_before, self._input_seen.pop(oldest))
         self._input_baseline_required = False
-        for record in sorted(eligible, key=lambda item: (item.observed_at, item.notice_id)):
+        return tuple(sorted(eligible, key=lambda item: (item.observed_at, item.notice_id)))
+
+    def _notify_inputs(self, records, overflow=()):
+        overflow = list(overflow)
+        for record in records:
             if not self._allowed():
                 self._input_baseline_required = True
                 break
+            identity = (record.source, record.task_id, record.turn_id)
+            observed = _observed(record)
+            pending = self._pending_authorizations.get(identity)
+            combined = pending is not None and _observed(pending.record) <= observed
+            if combined:
+                self._pending_authorizations.pop(identity, None)
+            for displaced in tuple(overflow):
+                candidate = displaced.record
+                if ((candidate.source, candidate.task_id, candidate.turn_id) == identity
+                        and _observed(candidate) <= observed):
+                    combined = True
+                    overflow.remove(displaced)
+            message = _INPUT_TEXT[record.status]
+            if combined:
+                record = InputNotification(
+                    **{field.name: getattr(record, field.name) for field in fields(InputNotice)},
+                    authorization_observed=True,
+                )
+                message += " 另外，也记录到了授权请求，方便的话请一并看看。"
             self.pet.notification.emit(
                 "宁宁 · AI任务提问",
-                "Codex · " + (_display(record.project) or "未命名项目") + "：" + _INPUT_TEXT[record.status],
+                "Codex · " + (_display(record.project) or "未命名项目") + "：" + message,
             )
             if self._allowed():
                 self.notification_ready.emit(record)
+        return overflow
 
     def _render(self, now=None):
         now = now or self._clock()
@@ -291,6 +412,8 @@ class WorkflowController(QObject):
         for row, record in enumerate(records):
             observed = _observed(record)
             state = _STATUS_TEXT[record.status]
+            if record.source == "codex" and record.event == "PermissionRequest":
+                state = "记录到授权请求，请回 Codex 核对"
             if self._read_error:
                 state = "来源暂不可读；" + state
             elif record.is_stale(now):
@@ -339,6 +462,7 @@ class WorkflowController(QObject):
         self._watch_started = self._clock()
         self._input_baseline_required = True
         self._input_watch_started = self._watch_started
+        self._pending_authorizations.clear()
         self._sync_tracking()
         if self._allowed():
             self.poll()
@@ -383,6 +507,9 @@ class WorkflowController(QObject):
         self.timer.stop()
         self._snapshots.clear()
         self._input_notices.clear()
+        self._pending_authorizations.clear()
+        self._authorization_seen.clear()
+        self._terminal_seen.clear()
         self._input_seen.clear()
         self.dialog.hide()
         self.dialog.setEnabled(False)

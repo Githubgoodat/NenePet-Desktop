@@ -7,9 +7,9 @@ from __future__ import annotations
 
 from collections import deque
 from datetime import datetime, timedelta, timezone
-import hashlib
 import importlib
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+import re
 import sys
 import threading
 
@@ -26,15 +26,21 @@ from aipet.core.weixin_notify import (
 
 _SOURCES = {"codex": "Codex", "grok_bot": "grok bot（协作上报）"}
 _STATES = {
-    "needs_attention": "需要你的确认，请回任务来源查看。",
-    "turn_ended": "本轮结束，待查看；这不代表整个任务完成。",
-    "phase_ended": "阶段结束，待查看；这不代表整个任务完成。",
-    "interrupted": "本轮已中断，请回任务来源确认。",
-    "failed": "协作方上报失败，请回任务来源核对。",
-    "input_requested": "发起输入请求，请回 Codex 查看。",
-    "question_opened": "发起提问，任务可能仍在继续，请回 Codex 查看。",
+    "needs_attention": "〈{project}〉这边记录到授权请求了。是否还需要处理，方便的话回 {where} 确认一下吧。",
+    "turn_ended": "〈{project}〉这一轮结束了。方便的话，回 {where} 看看结果吧。不过，这还不代表整个任务完成。",
+    "phase_ended": "〈{project}〉这个阶段结束了。方便的时候，回 {where} 看看结果吧。这还不代表整个任务完成。",
+    "interrupted": "〈{project}〉这一轮中断了。方便的时候，回 {where} 确认一下要不要继续吧。",
+    "failed": "〈{project}〉那边上报了失败。回 {where} 核对一下具体情况吧，我先提醒你一声。",
+    "input_requested": "那个，〈{project}〉这边发起了输入请求。方便的话，回 Codex 看看吧。",
+    "question_opened": "那个，〈{project}〉这边有个问题想请你看看。方便的话，回 Codex 看看吧。任务可能仍在继续。",
+}
+_STATE_LABELS = {
+    "needs_attention": "授权请求", "turn_ended": "本轮结束", "phase_ended": "阶段结束",
+    "interrupted": "本轮中断", "failed": "来源上报失败",
+    "input_requested": "输入请求", "question_opened": "提问事件",
 }
 _INPUT_STATES = {"input_requested", "question_opened"}
+_TERMINAL_STATES = {"turn_ended", "phase_ended", "interrupted", "failed"}
 _DEFINITIVE_FAILURES = {
     "api_rejected_minus2", "api_rejected", "session_expired", "context_missing",
     "credentials_missing", "context_refresh_required",
@@ -58,14 +64,47 @@ def _utc_now():
     return datetime.now(timezone.utc)
 
 
+def _project_name(snapshot):
+    """Return only the authorized project basename, never an opaque task id."""
+    value = getattr(snapshot, "project", None)
+    if not isinstance(value, str):
+        return "未命名项目"
+    value = " ".join("".join(
+        " " if char.isspace() else char if char.isprintable() and char not in "〈〉" else ""
+        for char in value
+    ).split())
+    # A URL is a device/account address rather than a project pathname.
+    if re.match(r"^[A-Za-z][A-Za-z0-9+.-]+://", value):
+        return "未命名项目"
+    label = PureWindowsPath(value).name.strip()
+    if not label or label in {".", ".."} or ":" in label:
+        return "未命名项目"
+    identifiers = (getattr(snapshot, field, None) for field in ("task_id", "turn_id", "notice_id"))
+    if any(isinstance(identity, str) and identity
+           and (identity == label or len(identity) >= 8 and identity in label)
+           for identity in identifiers):
+        return "未命名项目"
+    return label[:70].strip() or "未命名项目"
+
+
 def notice_text(snapshot):
-    source, state = _SOURCES.get(snapshot.source), _STATES.get(snapshot.status)
-    if source is None or state is None or not isinstance(snapshot.task_id, str):
+    source_name, status = getattr(snapshot, "source", None), getattr(snapshot, "status", None)
+    if not isinstance(source_name, str) or not isinstance(status, str):
         return None
-    if snapshot.status in _INPUT_STATES and snapshot.source != "codex":
+    source, state = _SOURCES.get(source_name), _STATES.get(status)
+    if source is None or state is None or not isinstance(getattr(snapshot, "task_id", None), str):
         return None
-    short_id = hashlib.sha256((snapshot.source + "\0" + snapshot.task_id).encode("utf-8")).hexdigest()[:10]
-    return "宁宁 · AI任务提醒\n来源：" + source + "\n状态：" + state + "\n任务代号：" + short_id
+    if status in _INPUT_STATES and source_name != "codex":
+        return None
+    label = _STATE_LABELS[status]
+    if status == "needs_attention" and source_name == "grok_bot":
+        label = "需要输入"
+        state = "那个，〈{project}〉那边说需要你补充信息。方便的话，回 grok bot 看看具体问题吧。"
+    body = state.format(project=_project_name(snapshot), where="Codex" if source_name == "codex" else "grok bot")
+    if status in _INPUT_STATES and getattr(snapshot, "authorization_observed", False) is True:
+        label += "／授权记录"
+        body += "另外，也记录到了授权请求，方便的话请一并看看。"
+    return "宁宁 · 任务提醒\n来源：" + source + "\n状态：" + label + "\n" + body
 
 
 def _load_qrcode():
@@ -169,7 +208,7 @@ class WeixinDialog(QDialog):
         layout = QVBoxLayout(self)
         self.info = QLabel(
             "使用开源微信渠道直接发给扫码本人，不经过公众号推送。\n"
-            "只发送任务来源、状态和哈希短代号，不发送项目名、路径或聊天正文，不执行手机消息。\n"
+            "按你的选择发送项目名、来源和状态；项目只取文件夹名称，不含完整路径、聊天正文或任务编号，也不执行手机消息。\n"
             "登录保存在本机时使用当前系统账户的安全存储。服务受理不等于手机已收到。"
         )
         self.info.setTextFormat(Qt.PlainText)
@@ -495,6 +534,7 @@ class WeixinNotifyController(QObject):
         if text is None or snapshot.is_stale(now):
             return
         is_input = snapshot.status in _INPUT_STATES
+        terminal = snapshot.status in _TERMINAL_STATES
         if is_input:
             notice_id = getattr(snapshot, "notice_id", None)
             if snapshot.source != "codex" or not isinstance(notice_id, str) or not notice_id:
@@ -517,10 +557,17 @@ class WeixinNotifyController(QObject):
                 removed = self._input_seen.pop(oldest)
                 self._input_seen_before = max(self._input_seen_before or removed, removed)
         else:
-            key = (snapshot.source, snapshot.task_id, snapshot.status)
+            key = (("terminal", snapshot.source, snapshot.task_id, snapshot.turn_id, snapshot.status)
+                   if terminal else (snapshot.source, snapshot.task_id, snapshot.status))
             last = self._last_sent.get(key)
-            if last is not None and now - last < timedelta(seconds=30):
+            if last is not None and (terminal or now - last < timedelta(seconds=30)):
                 return
+            if terminal:
+                # The same terminal fact can be delivered with a newer file
+                # timestamp. Consume its stable turn identity, including drops.
+                self._last_sent[key] = now
+                if len(self._last_sent) > 256:
+                    self._last_sent.pop(min(self._last_sent, key=self._last_sent.get))
         critical = is_input or snapshot.status == "needs_attention"
         ordinary_waiting = sum(not urgent for urgent, _, _ in self._queue)
         if critical and len(self._queue) >= 4:
@@ -533,7 +580,7 @@ class WeixinNotifyController(QObject):
         if len(self._queue) >= 4 or not critical and ordinary_waiting >= 3:
             self._set_status("微信提醒待发队列已满，本条已丢弃；不会之后补发。")
             return
-        if not is_input:
+        if not is_input and not terminal:
             self._last_sent[key] = now
             if len(self._last_sent) > 256:
                 self._last_sent.pop(min(self._last_sent, key=self._last_sent.get))

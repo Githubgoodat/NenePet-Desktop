@@ -111,9 +111,10 @@ class WeixinUiTests(unittest.TestCase):
         self.controllers.append(controller)
         return controller
 
-    def snapshot(self, *, task="fixture-task", status="needs_attention", source="codex", seconds=0):
-        return TaskSnapshot(task, source, "private-project-name-must-not-leave", "FixtureEvent", status,
-                            (self.now + timedelta(seconds=seconds)).isoformat(), "fixture-turn")
+    def snapshot(self, *, task="fixture-task", status="needs_attention", source="codex", seconds=0,
+                 turn="fixture-turn"):
+        return TaskSnapshot(task, source, "authorized-project-name", "FixtureEvent", status,
+                            (self.now + timedelta(seconds=seconds)).isoformat(), turn)
 
     def input_notice(self, *, identity="question-one", status="input_requested", seconds=0, source="codex"):
         return InputNotice(
@@ -219,13 +220,13 @@ class WeixinUiTests(unittest.TestCase):
         self.assertEqual(len(self.jobs), 1)
         self.save.assert_not_called()
 
-    def test_task_notice_contains_only_fixed_source_state_and_hash(self):
+    def test_task_notice_contains_authorized_project_and_fixed_state_without_identifiers(self):
         record = self.snapshot(task="sensitive-id-do-not-send", source="grok_bot", status="phase_ended")
         text = notice_text(record)
         self.assertIn("协作上报", text)
         self.assertIn("不代表整个任务完成", text)
         self.assertNotIn(record.task_id, text)
-        self.assertNotIn(record.project, text)
+        self.assertEqual(text.count(record.project), 1)
         self.assertNotIn(record.turn_id, text)
         controller = self.make(enabled=True)
         controller.enqueue(record)
@@ -250,6 +251,21 @@ class WeixinUiTests(unittest.TestCase):
             controller.enqueue(self.snapshot(task="fixture-queued-" + str(index)))
         self.assertEqual(len(controller._queue), 4)
         self.assertIn("队列已满", controller.status_text)
+
+    def test_terminal_dedup_is_stable_per_turn_without_suppressing_adjacent_turns(self):
+        for status in ("turn_ended", "phase_ended", "interrupted", "failed"):
+            with self.subTest(status=status):
+                controller = self.make(enabled=True)
+                before = len(self.jobs)
+                controller.enqueue(self.snapshot(task="stable-task", status=status, turn="first-turn"))
+                self.jobs[-1].complete(WeixinSendResult(True))
+                self.now += timedelta(seconds=1)
+                controller.enqueue(self.snapshot(task="stable-task", status=status, turn="second-turn"))
+                self.assertEqual(len(self.jobs), before + 2)
+                self.jobs[-1].complete(WeixinSendResult(True))
+                self.now += timedelta(seconds=31)
+                controller.enqueue(self.snapshot(task="stable-task", status=status, turn="first-turn"))
+                self.assertEqual(len(self.jobs), before + 2)
 
     def test_dnd_clears_pending_and_ignores_late_response_without_replay(self):
         controller = self.make(enabled=True)
@@ -345,7 +361,8 @@ class WeixinUiTests(unittest.TestCase):
                 record = self.input_notice(status=status)
                 text = notice_text(record)
                 self.assertIn("Codex", text)
-                for private in (record.task_id, record.turn_id, record.project, record.notice_id):
+                self.assertEqual(text.count(record.project), 1)
+                for private in (record.task_id, record.turn_id, record.notice_id):
                     self.assertNotIn(private, text)
                 self.assertNotIn("暂停", text)
         self.assertIn("可能仍在继续", notice_text(self.input_notice(status="question_opened")))

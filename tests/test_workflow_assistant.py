@@ -17,7 +17,7 @@ from PyQt5.QtWidgets import QApplication
 from aipet.core.config import AppSettings
 from aipet.core.workflow_events import TaskSnapshot, publish_hook_event
 from aipet.core.workflow_input_notices import InputNotice, publish_input_notice
-from aipet.ui.workflow_assistant import WorkflowController
+from aipet.ui.workflow_assistant import InputNotification, WorkflowController
 
 
 @dataclass(frozen=True)
@@ -92,8 +92,10 @@ class WorkflowTests(unittest.TestCase):
 
     def input_notice(self, *, identity="question-one", seconds=0, status="input_requested", **values):
         return InputNotice(
-            notice_id=hashlib.sha256(identity.encode()).hexdigest(), task_id="fixture-session",
-            turn_id="fixture-turn", project=values.pop("project", "synthetic-project"),
+            notice_id=hashlib.sha256(identity.encode()).hexdigest(),
+            task_id=values.pop("task_id", "fixture-session"),
+            turn_id=values.pop("turn_id", "fixture-turn"),
+            project=values.pop("project", "synthetic-project"),
             status=status, observed_at=(self.now + timedelta(seconds=seconds)).isoformat(), **values,
         )
 
@@ -124,6 +126,10 @@ class WorkflowTests(unittest.TestCase):
             self.advance()
             self.loader.return_value = (self.event(event=event, status=status),)
             controller.poll()
+            if event == "PermissionRequest":
+                self.assertEqual(self.notices, [])
+                self.advance(30)
+                controller.poll()
             controller.poll()
         self.assertEqual(len(self.notices), 3)
         self.assertIn("不能证明任务完成", self.notices[1][1])
@@ -211,7 +217,401 @@ class WorkflowTests(unittest.TestCase):
         self.advance()
         self.loader.return_value = (self.event(event="PermissionRequest", status="needs_attention"),)
         controller.poll()
+        self.advance(30)
+        controller.poll()
         self.assertEqual(len(self.notices), 1)
+
+    def test_approval_then_explicit_question_preserves_both_facts_in_one_phone_event(self):
+        controller = self.make()
+        ready = []
+        controller.notification_ready.connect(ready.append)
+        self.advance()
+        approval = self.event(event="PermissionRequest", status="needs_attention")
+        self.loader.return_value = (approval,)
+        controller.poll()
+        self.assertEqual(ready, [])
+        self.advance(4)
+        question = self.input_notice(status="question_opened")
+        self.input_loader.return_value = (question,)
+        controller.poll()
+        self.advance(40)
+        controller.poll()
+        self.assertEqual(len(ready), 1)
+        self.assertIsInstance(ready[0], InputNotification)
+        self.assertEqual(ready[0].notice_id, question.notice_id)
+        self.assertEqual(ready[0].observed_at, question.observed_at)
+        self.assertTrue(ready[0].authorization_observed)
+        self.assertFalse(hasattr(question, "authorization_observed"))
+        self.assertEqual(controller._input_notices[question.notice_id], question)
+        self.assertIn("可能仍在继续", self.notices[0][1])
+        self.assertIn("也记录到了授权请求", self.notices[0][1])
+        from aipet.ui.weixin_notify import notice_text
+        phone = notice_text(ready[0])
+        self.assertIn("有个问题", phone)
+        self.assertIn("也记录到了授权请求", phone)
+        self.assertNotIn("已批准", phone)
+        self.assertEqual(len(self.notices), 1)
+
+    def test_same_poll_question_merges_older_approval_before_deadline_flush(self):
+        controller = self.make()
+        ready = []
+        controller.notification_ready.connect(ready.append)
+        self.advance()
+        approval = self.event(event="PermissionRequest", status="needs_attention")
+        self.advance(45)
+        question = self.input_notice()
+        self.loader.return_value = (approval,)
+        self.input_loader.return_value = (question,)
+        controller.poll()
+        self.assertEqual(len(ready), 1)
+        self.assertEqual(ready[0].notice_id, question.notice_id)
+        self.assertTrue(ready[0].authorization_observed)
+        self.advance(40)
+        controller.poll()
+        self.assertEqual(len(ready), 1)
+        self.assertFalse(controller._pending_authorizations)
+
+    def test_combined_question_routes_once_through_real_bark_controller_with_fake_worker(self):
+        from aipet.core.bark_notify import BarkConfig, BarkSendResult
+        from aipet.ui.bark_notify import BarkNotifyController
+        from aipet.ui.phone_router import PhoneNotificationRouter
+        from tests.test_bark_notify_ui import FakeWorker
+
+        jobs = []
+
+        def factory(*args, **kwargs):
+            worker = FakeWorker(*args, **kwargs)
+            jobs.append(worker)
+            return worker
+
+        with (patch("requests.Session", side_effect=AssertionError("Offline integration only")),
+              patch("aipet.ui.bark_notify.load_config",
+                    return_value=BarkConfig(True, "synthetic-device-key")),
+              patch("aipet.ui.bark_notify.save_config",
+                    side_effect=AssertionError("Do not persist notification settings"))):
+            controller = self.make()
+            bark = BarkNotifyController(
+                self.pet, config_path=Path("synthetic-unwritten-bark-config"),
+                worker_factory=factory, clock=lambda: self.now,
+            )
+            self.controllers.append(bark)
+            primary = Mock()
+            primary.can_send_automatic.return_value = False
+            router = PhoneNotificationRouter(primary, bark)
+            self.addCleanup(router.shutdown)
+            controller.notification_ready.connect(router.enqueue)
+            self.advance()
+            self.loader.return_value = (self.event(event="PermissionRequest", status="needs_attention"),)
+            self.advance()
+            question = self.input_notice(status="question_opened", project="合成项目")
+            self.input_loader.return_value = (question,)
+            controller.poll()
+            controller.poll()
+            self.advance(40)
+            controller.poll()
+            self.assertEqual(len(jobs), 1)
+            self.assertEqual(jobs[0].operation, "send")
+            text = jobs[0].arguments[1]
+            self.assertIn("合成项目", text)
+            self.assertIn("有个问题", text)
+            self.assertIn("也记录到了授权请求", text)
+            self.assertNotIn(question.task_id, text)
+            self.assertNotIn(question.notice_id, text)
+            primary.enqueue.assert_not_called()
+            jobs[0].complete(BarkSendResult(True))
+            self.assertFalse(bark._queue)
+            self.assertEqual(len(jobs), 1)
+
+    def test_progress_other_turn_and_missing_latest_snapshot_do_not_swallow_authorization(self):
+        for event, status, turn in (("PreToolUse", "running", "fixture-turn"),
+                                    ("PreToolUse", "running", "parallel-child-turn"),
+                                    ("Stop", "turn_ended", "parallel-child-turn"),
+                                    (None, None, None)):
+            with self.subTest(event=event, turn=turn):
+                self.notices.clear()
+                self.loader.return_value = ()
+                controller = self.make()
+                ready = []
+                controller.notification_ready.connect(ready.append)
+                self.advance()
+                approval = self.event(event="PermissionRequest", status="needs_attention")
+                self.loader.return_value = (approval,)
+                controller.poll()
+                self.advance(3)
+                progress = self.event(event=event, status=status, turn_id=turn) if event else None
+                self.loader.return_value = (progress,) if progress else ()
+                controller.poll()
+                self.assertTrue(controller._pending_authorizations)
+                self.advance(27)
+                controller.poll()
+                self.assertIn(approval, ready)
+                self.assertEqual(len(ready), 1 + int(status == "turn_ended"))
+                self.assertFalse(controller._pending_authorizations)
+
+    def test_parent_and_parallel_child_authorizations_have_independent_deadlines(self):
+        controller = self.make()
+        ready = []
+        controller.notification_ready.connect(ready.append)
+        self.advance()
+        parent = self.event(event="PermissionRequest", status="needs_attention")
+        self.loader.return_value = (parent,)
+        controller.poll()
+        self.advance(4)
+        child = self.event(event="PermissionRequest", status="needs_attention", turn_id="child-turn")
+        self.loader.return_value = (child,)
+        controller.poll()
+        self.assertEqual(len(controller._pending_authorizations), 2)
+        self.advance(26)
+        controller.poll()
+        self.assertEqual(ready, [parent])
+        self.advance(4)
+        controller.poll()
+        self.assertEqual(ready, [parent, child])
+
+    def test_repeated_authorizations_update_record_without_extending_first_deadline(self):
+        controller = self.make()
+        ready = []
+        controller.notification_ready.connect(ready.append)
+        self.advance()
+        first = self.event(event="PermissionRequest", status="needs_attention")
+        self.loader.return_value = (first,)
+        controller.poll()
+        self.advance(20)
+        repeated = self.event(event="PermissionRequest", status="needs_attention")
+        self.loader.return_value = (repeated,)
+        controller.poll()
+        self.advance(9)
+        controller.poll()
+        self.assertFalse(ready)
+        self.advance()
+        controller.poll()
+        controller.poll()
+        self.assertEqual(ready, [repeated])
+        self.assertFalse(controller._pending_authorizations)
+
+    def test_late_authorization_after_already_sent_question_is_not_silently_discarded(self):
+        controller = self.make()
+        ready = []
+        controller.notification_ready.connect(ready.append)
+        self.advance()
+        delayed_approval = self.event(event="PermissionRequest", status="needs_attention")
+        self.advance(4)
+        question = self.input_notice()
+        self.input_loader.return_value = (question,)
+        self.loader.return_value = (self.event(event="PreToolUse", status="running"),)
+        controller.poll()
+        self.assertEqual(ready, [question])
+        displayed = controller._snapshots[("codex", question.task_id)]
+        self.advance()
+        self.loader.return_value = (delayed_approval,)
+        controller.poll()
+        self.assertTrue(controller._pending_authorizations)
+        self.assertEqual(controller._snapshots[("codex", question.task_id)], displayed)
+        self.advance(25)
+        controller.poll()
+        self.assertEqual(ready, [question, delayed_approval])
+        self.assertNotIn("需要你的确认", self.notices[-1][1])
+
+    def test_two_independent_questions_remain_distinct_when_one_carries_authorization_fact(self):
+        controller = self.make()
+        ready = []
+        controller.notification_ready.connect(ready.append)
+        self.advance()
+        approval = self.event(event="PermissionRequest", status="needs_attention")
+        self.loader.return_value = (approval,)
+        self.advance()
+        first = self.input_notice(identity="independent-first")
+        second = self.input_notice(identity="independent-second", status="question_opened")
+        self.input_loader.return_value = (second, first)
+        controller.poll()
+        controller.poll()
+        self.assertEqual({record.notice_id for record in ready}, {first.notice_id, second.notice_id})
+        self.assertEqual(len(ready), 2)
+        self.assertEqual(sum(getattr(record, "authorization_observed", False) for record in ready), 1)
+        self.advance(40)
+        controller.poll()
+        self.assertEqual(len(ready), 2)
+
+    def test_question_in_another_turn_does_not_merge_or_discard_parent_authorization(self):
+        controller = self.make()
+        ready = []
+        controller.notification_ready.connect(ready.append)
+        self.advance()
+        approval = self.event(event="PermissionRequest", status="needs_attention")
+        self.loader.return_value = (approval,)
+        controller.poll()
+        self.advance()
+        question = self.input_notice(turn_id="parallel-child-turn")
+        self.input_loader.return_value = (question,)
+        controller.poll()
+        self.assertEqual(ready, [question])
+        self.assertTrue(controller._pending_authorizations)
+        self.advance(29)
+        controller.poll()
+        self.assertEqual(ready, [question, approval])
+
+    def test_authorization_capacity_emits_displaced_facts_instead_of_dropping_them(self):
+        controller = self.make()
+        ready = []
+        controller.notification_ready.connect(ready.append)
+        self.advance()
+        first = tuple(self.event(task_id=f"pending-{index:03}", event="PermissionRequest",
+                                 status="needs_attention") for index in range(128))
+        self.loader.return_value = first
+        controller.poll()
+        self.assertEqual(len(controller._pending_authorizations), 128)
+        self.assertFalse(ready)
+        self.advance()
+        extra = self.event(task_id="overflow-pending", event="PermissionRequest", status="needs_attention")
+        self.loader.return_value = (extra,)
+        controller.poll()
+        self.assertEqual(len(controller._pending_authorizations), 128)
+        self.assertEqual(len(ready), 1)
+        self.advance(30)
+        controller.poll()
+        self.assertEqual({item.task_id for item in ready}, {item.task_id for item in (*first, extra)})
+        self.assertEqual(len(ready), 129)
+
+    def test_sent_authorization_does_not_replay_when_latest_snapshot_disappears_and_returns(self):
+        controller = self.make()
+        ready = []
+        controller.notification_ready.connect(ready.append)
+        self.advance()
+        approval = self.event(event="PermissionRequest", status="needs_attention")
+        self.loader.return_value = (approval,)
+        controller.poll()
+        self.advance(30)
+        controller.poll()
+        self.assertEqual(ready, [approval])
+        self.loader.return_value = ()
+        controller.poll()
+        self.loader.return_value = (approval,)
+        controller.poll()
+        self.advance(30)
+        controller.poll()
+        self.assertEqual(ready, [approval])
+        self.assertFalse(controller._pending_authorizations)
+
+    def test_input_read_error_clears_authorization_and_recovery_does_not_replay_it(self):
+        controller = self.make()
+        ready = []
+        controller.notification_ready.connect(ready.append)
+        self.advance()
+        approval = self.event(event="PermissionRequest", status="needs_attention")
+        self.loader.return_value = (approval,)
+        controller.poll()
+        self.input_loader.side_effect = OSError("synthetic input read error")
+        controller.poll()
+        self.assertFalse(controller._pending_authorizations)
+        self.input_loader.side_effect = None
+        self.advance(40)
+        controller.poll()
+        self.assertFalse(ready)
+        self.assertFalse(controller._pending_authorizations)
+
+    def test_lifecycle_read_error_keeps_question_independent_without_replaying_discarded_approval(self):
+        controller = self.make()
+        ready = []
+        controller.notification_ready.connect(ready.append)
+        self.advance()
+        approval = self.event(event="PermissionRequest", status="needs_attention")
+        self.loader.return_value = (approval,)
+        controller.poll()
+        self.advance()
+        question = self.input_notice()
+        self.input_loader.return_value = (question,)
+        self.loader.side_effect = OSError("synthetic lifecycle read error")
+        controller.poll()
+        self.assertEqual(ready, [question])
+        self.assertFalse(controller._pending_authorizations)
+        self.loader.side_effect = None
+        self.advance(40)
+        controller.poll()
+        controller.poll()
+        self.assertEqual(ready, [question])
+
+    def test_newer_authorization_after_question_is_independent_and_is_not_claimed_waiting(self):
+        controller = self.make()
+        ready = []
+        controller.notification_ready.connect(ready.append)
+        self.advance()
+        question = self.input_notice()
+        self.input_loader.return_value = (question,)
+        controller.poll()
+        self.advance()
+        approval = self.event(event="PermissionRequest", status="needs_attention")
+        self.loader.return_value = (approval,)
+        controller.poll()
+        self.advance(29)
+        controller.poll()
+        self.assertEqual(ready, [question])
+        self.advance()
+        controller.poll()
+        controller.poll()
+        self.assertEqual(ready, [question, approval])
+        self.assertIn("是否仍需处理", self.notices[-1][1])
+        self.assertNotIn("需要你的确认", self.notices[-1][1])
+
+    def test_grok_needs_input_stays_immediate_and_other_tasks_are_not_coalesced(self):
+        controller = self.make()
+        ready = []
+        controller.notification_ready.connect(ready.append)
+        self.advance()
+        approval = self.event(event="PermissionRequest", status="needs_attention")
+        grok = self.event(source="grok_bot", event="GrokNeedsInput", status="needs_attention")
+        self.loader.return_value = (approval, grok)
+        controller.poll()
+        self.assertEqual(ready, [grok])
+        self.advance(30)
+        controller.poll()
+        self.assertEqual(ready, [grok, approval])
+
+    def test_pause_test_stop_and_reader_error_discard_pending_approvals(self):
+        for action in ("dnd", "test", "disabled", "shutdown", "read_error", "input_error"):
+            with self.subTest(action=action):
+                self.pet = Pet()
+                self.loader.side_effect = self.input_loader.side_effect = None
+                self.loader.return_value = self.input_loader.return_value = ()
+                controller = self.make()
+                ready = []
+                controller.notification_ready.connect(ready.append)
+                self.advance()
+                self.loader.return_value = (self.event(event="PermissionRequest", status="needs_attention"),)
+                controller.poll()
+                self.assertTrue(controller._pending_authorizations)
+                if action == "dnd":
+                    self.pet.pause(True)
+                elif action == "test":
+                    self.pet.test_mode_changed.emit(True)
+                elif action == "disabled":
+                    controller.set_enabled(False)
+                elif action == "shutdown":
+                    controller.shutdown()
+                else:
+                    (self.loader if action == "read_error" else self.input_loader).side_effect = OSError("fixture")
+                    controller.poll()
+                self.advance(40)
+                controller.poll()
+                self.assertFalse(ready)
+                self.assertFalse(controller._pending_authorizations)
+
+    def test_terminal_dedup_uses_turn_state_identity_instead_of_changed_timestamp(self):
+        controller = self.make()
+        ready = []
+        controller.notification_ready.connect(ready.append)
+        self.advance()
+        first = self.event()
+        self.loader.return_value = (first,)
+        controller.poll()
+        self.advance()
+        self.loader.return_value = (self.event(),)
+        controller.poll()
+        self.assertEqual(ready, [first])
+        self.advance()
+        next_turn = self.event(turn_id="another-turn")
+        self.loader.return_value = (next_turn,)
+        controller.poll()
+        self.assertEqual(ready, [first, next_turn])
 
     def test_initial_dnd_never_scans_or_opens_window(self):
         self.pet._paused = True

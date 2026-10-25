@@ -200,14 +200,15 @@ class BarkUiTests(unittest.TestCase):
         self.assertFalse(controller._enabled)
         self.assertFalse(self.jobs)
 
-    def test_automatic_notice_contains_only_fixed_metadata_and_hashed_task(self):
+    def test_automatic_notice_contains_authorized_project_and_no_private_identifiers(self):
         controller = self.make(enabled=True)
         self.advance()
         record = self.snapshot(status="phase_ended", source="grok_bot")
         controller.enqueue(record)
         self.assertEqual(self.jobs[-1].arguments, (KEY, notice_text(record)))
         text = self.jobs[-1].arguments[-1]
-        for private in (record.task_id, record.project, record.turn_id, KEY):
+        self.assertEqual(text.count(record.project), 1)
+        for private in (record.task_id, record.turn_id, KEY):
             self.assertNotIn(private, text)
 
     def test_unknown_running_stale_future_and_prebaseline_notices_do_not_send(self):
@@ -219,19 +220,31 @@ class BarkUiTests(unittest.TestCase):
             controller.enqueue(record)
         self.assertFalse(self.jobs)
 
-    def test_lifecycle_identity_uses_turn_state_and_observation_without_duplicate(self):
+    def test_terminal_identity_ignores_changed_time_but_new_turn_or_state_can_notify(self):
         controller = self.make(enabled=True)
         self.advance()
-        record = self.snapshot()
+        record = self.snapshot(status="turn_ended")
         controller.enqueue(record)
         self.jobs[-1].complete(BarkSendResult(True))
         self.advance(31)
         controller.enqueue(record)
         self.assertEqual(len(self.jobs), 1)
-        controller.enqueue(self.snapshot())
+        controller.enqueue(self.snapshot(status="turn_ended"))
+        self.assertEqual(len(self.jobs), 1)
+        controller.enqueue(self.snapshot(turn="another-turn", status="turn_ended"))
         self.jobs[-1].complete(BarkSendResult(True))
-        controller.enqueue(self.snapshot(turn="another-turn"))
+        controller.enqueue(self.snapshot(turn="another-turn", status="interrupted"))
         self.assertEqual(len(self.jobs), 3)
+
+    def test_attention_can_repeat_when_a_new_observation_arrives(self):
+        controller = self.make(enabled=True)
+        self.advance()
+        record = self.snapshot(status="needs_attention")
+        controller.enqueue(record)
+        self.jobs[-1].complete(BarkSendResult(True))
+        self.advance()
+        controller.enqueue(self.snapshot(status="needs_attention"))
+        self.assertEqual(len(self.jobs), 2)
 
     def test_input_identity_is_independent_and_async_text_does_not_claim_pause(self):
         controller = self.make(enabled=True)

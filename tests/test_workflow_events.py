@@ -107,6 +107,97 @@ class WorkflowEventTests(unittest.TestCase):
         self.assertFalse(self.publish("PreToolUse", now=terminal_time + timedelta(seconds=1)))
         self.assertEqual(self.files()[0].read_bytes(), original)
 
+    def test_repeated_stop_is_idempotent_without_timestamp_or_file_refresh(self):
+        self.assertTrue(self.publish("Stop"))
+        path, = self.files()
+        original, original_mtime = path.read_bytes(), path.stat().st_mtime_ns
+        with patch("aipet.core.workflow_events.os.replace", side_effect=AssertionError("No rewrite")):
+            for seconds in (0, 1, 20, 600):
+                with self.subTest(seconds=seconds):
+                    current = self.now + timedelta(seconds=seconds)
+                    self.assertTrue(self.publish("Stop", now=current))
+                    snapshot, = load_snapshots(self.inbox, current)
+                    self.assertEqual(snapshot.event, "Stop")
+                    self.assertEqual(snapshot.observed_at, "2026-10-24T12:00:00.000000Z")
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(path.stat().st_mtime_ns, original_mtime)
+        self.assertTrue(snapshot.is_stale(current))
+
+    def test_repeated_grok_phase_ended_is_idempotent_without_refresh(self):
+        values = {"task_id": "grok-fixture", "phase_id": "phase-one",
+                  "event": "GrokPhaseEnded", "project": "Example"}
+        self.assertTrue(publish_task_event(self.inbox, **values, now=self.now))
+        path, = self.files()
+        original, original_mtime = path.read_bytes(), path.stat().st_mtime_ns
+        with patch("aipet.core.workflow_events.os.replace", side_effect=AssertionError("No rewrite")):
+            for seconds in (0, 1, 30):
+                with self.subTest(seconds=seconds):
+                    current = self.now + timedelta(seconds=seconds)
+                    self.assertTrue(publish_task_event(self.inbox, **values, now=current))
+                    snapshot, = load_snapshots(self.inbox, current)
+                    self.assertEqual(snapshot.status, "phase_ended")
+                    self.assertEqual(snapshot.observed_at, "2026-10-24T12:00:00.000000Z")
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(path.stat().st_mtime_ns, original_mtime)
+
+    def test_duplicate_terminal_cannot_hide_new_turn_in_either_source(self):
+        for source in ("codex", "grok_bot"):
+            with self.subTest(source=source):
+                if source == "codex":
+                    self.assertTrue(self.publish("Stop", now=self.now))
+                    self.assertTrue(self.publish(turn="next-turn", now=self.now + timedelta(seconds=1)))
+                    self.assertTrue(self.publish("Stop", now=self.now + timedelta(seconds=2)))
+                else:
+                    values = {"task_id": "grok-fixture", "project": "Example"}
+                    self.assertTrue(publish_task_event(self.inbox, **values, phase_id="phase-one",
+                        event="GrokPhaseEnded", now=self.now))
+                    self.assertTrue(publish_task_event(self.inbox, **values, phase_id="phase-two",
+                        event="GrokRunning", now=self.now + timedelta(seconds=1)))
+                    self.assertTrue(publish_task_event(self.inbox, **values, phase_id="phase-one",
+                        event="GrokPhaseEnded", now=self.now + timedelta(seconds=2)))
+                snapshot, = (item for item in load_snapshots(self.inbox, self.now + timedelta(seconds=2))
+                              if item.source == source)
+                self.assertEqual(snapshot.status, "running")
+                self.assertEqual(snapshot.turn_id, "next-turn" if source == "codex" else "phase-two")
+
+    def test_duplicate_terminal_still_allows_different_terminal_same_turn(self):
+        self.assertTrue(self.publish("Stop"))
+        self.assertTrue(self.publish("Stop", now=self.now + timedelta(seconds=1)))
+        self.assertTrue(self.publish("Interrupt", now=self.now + timedelta(seconds=2)))
+        snapshot, = load_snapshots(self.inbox, self.now + timedelta(seconds=2))
+        self.assertEqual((snapshot.event, snapshot.status), ("Interrupt", "interrupted"))
+        self.assertEqual(snapshot.observed_at, "2026-10-24T12:00:02.000000Z")
+        values = {"task_id": "grok-fixture", "phase_id": "phase-one", "project": "Example"}
+        self.assertTrue(publish_task_event(self.inbox, **values, event="GrokPhaseEnded", now=self.now))
+        self.assertTrue(publish_task_event(self.inbox, **values, event="GrokPhaseEnded",
+                                         now=self.now + timedelta(seconds=1)))
+        self.assertTrue(publish_task_event(self.inbox, **values, event="GrokFailed",
+                                         now=self.now + timedelta(seconds=2)))
+        snapshot, = (item for item in load_snapshots(self.inbox, self.now + timedelta(seconds=2))
+                      if item.source == "grok_bot")
+        self.assertEqual((snapshot.event, snapshot.status), ("GrokFailed", "failed"))
+        self.assertEqual(snapshot.observed_at, "2026-10-24T12:00:02.000000Z")
+
+    def test_repeated_nonterminal_still_refreshes_progress(self):
+        for event in ("UserPromptSubmit", "PreToolUse", "PermissionRequest"):
+            with self.subTest(event=event):
+                self.assertTrue(self.publish(event, session=event))
+                self.assertTrue(self.publish(event, session=event, now=self.now + timedelta(seconds=1)))
+        values = {"task_id": "grok-fixture", "phase_id": "phase-one", "project": "Example"}
+        self.assertTrue(publish_task_event(self.inbox, **values, event="GrokRunning", now=self.now))
+        self.assertTrue(publish_task_event(self.inbox, **values, event="GrokRunning",
+                                         now=self.now + timedelta(seconds=1)))
+        self.assertEqual({item.observed_at for item in load_snapshots(self.inbox, self.now + timedelta(seconds=1))},
+                         {"2026-10-24T12:00:01.000000Z"})
+
+    def test_terminal_project_label_change_is_not_only_timestamp_duplicate(self):
+        self.assertTrue(self.publish("Stop"))
+        changed = self.payload("Stop") | {"cwd": "C:\\ExampleWorkspace\\Renamed Project"}
+        self.assertTrue(publish_hook_event(self.inbox, changed, now=self.now + timedelta(seconds=1)))
+        snapshot, = load_snapshots(self.inbox, self.now + timedelta(seconds=1))
+        self.assertEqual(snapshot.project, "Renamed Project")
+        self.assertEqual(snapshot.observed_at, "2026-10-24T12:00:01.000000Z")
+
     def test_reader_rejects_unknown_source_unknown_fields_and_wrong_filename(self):
         self.publish()
         path = self.files()[0]

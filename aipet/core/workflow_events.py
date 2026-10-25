@@ -190,8 +190,9 @@ def _inbox_lock(inbox: Path):
 def _publish_snapshot(inbox: Path, value: dict, current: datetime) -> bool:
     """Write one validated producer snapshot; never execute a producer action.
 
-    Updates are serialized and compared by observation time. A terminal event
-    cannot be overwritten by a late nonterminal event for the same turn.
+    Updates are serialized and compared by observation time. Repeated terminal
+    observations are accepted without refreshing the original timestamp. A
+    terminal event cannot be overwritten by a late nonterminal for that turn.
     At capacity, only validated stale or terminal own snapshots may be evicted.
     """
     temporary = None
@@ -210,6 +211,12 @@ def _publish_snapshot(inbox: Path, value: dict, current: datetime) -> bool:
             old = next((entry for path, entry in records if path == destination), None)
             if destination.exists() and old is None:
                 return False  # Never replace an unrecognized or damaged file.
+            if (old is not None and old.status in _TERMINAL
+                    and old.event == snapshot.event and old.project == snapshot.project):
+                # The same event identity is idempotent, not a fresh heartbeat.
+                # Stop can be continued by another hook: this snapshot records
+                # an observed stop, not proof that the turn cannot run again.
+                return True
             if old is not None and (old.observed_at >= snapshot.observed_at
                     or old.status in _TERMINAL and snapshot.status not in _TERMINAL):
                 return False

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime
 from pathlib import Path
+import tempfile
+import time
 from uuid import uuid4
 from typing import Literal
 
@@ -12,6 +15,62 @@ from pydantic import BaseModel, Field, ValidationError
 
 from aipet.core.config import get_user_data_dir
 from aipet.core.conversation_memory import ConversationMemory
+
+
+_WINDOWS_REPLACE_RETRY = os.name == "nt"
+_REPLACE_RETRY_DELAYS = (0.01, 0.02, 0.04, 0.08, 0.16)
+_REPLACE_RETRY_BUDGET = 0.5
+
+
+def _replace_storage_file(temporary: Path, destination: Path) -> None:
+    """Retry only Windows access/sharing conflicts within a short budget.
+
+    Access denied may also be permanent: retries are bounded and the original
+    OSError is propagated when they cannot complete the replacement.
+    """
+    deadline = time.monotonic() + _REPLACE_RETRY_BUDGET
+    for attempt in range(len(_REPLACE_RETRY_DELAYS) + 1):
+        try:
+            # Path.replace delegates to os.replace and preserves the existing
+            # error-injection boundary used by persistence regression tests.
+            temporary.replace(destination)
+            return
+        except OSError as error:
+            if (not _WINDOWS_REPLACE_RETRY or getattr(error, "winerror", None) not in {5, 32, 33}
+                    or attempt == len(_REPLACE_RETRY_DELAYS)):
+                raise
+            delay = _REPLACE_RETRY_DELAYS[attempt]
+            if time.monotonic() + delay > deadline:
+                raise
+            time.sleep(delay)
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    """Commit complete JSON using a closed, unique temporary in the same dir.
+
+    Serialization finishes before touching the filesystem. Independent writers
+    cannot overwrite each other's temporary data; the existing last-successful-
+    replacement semantics remain, without a lock or a read/merge operation.
+    """
+    encoded = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="wb", prefix=".aipet-storage-", suffix=".tmp",
+                                         dir=path.parent, delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        _replace_storage_file(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                # A cleanup error must not replace the actual save failure.
+                pass
 
 
 class ScreenMemoryEntry(BaseModel):
@@ -82,18 +141,12 @@ class ScreenMemoryStore:
         return True
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "events": [
                 entry.model_dump(mode="json") for entry in self.entries
             ]
         }
-        temporary = self.path.with_suffix(".json.tmp")
-        temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        temporary.replace(self.path)
+        _atomic_write_json(self.path, payload)
 
     def prompt_text(
         self,
@@ -267,7 +320,6 @@ class HistoryStore:
         return valid[-self.limit :]
 
     def save(self, messages: list[dict[str, str]]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {"messages": messages[-self.limit :]}
         # Retain a loaded archive while another profile is active, but never
         # recall or append it for that profile. Both memory layers commit once.
@@ -275,12 +327,7 @@ class HistoryStore:
             payload["nene_conversation_memory"] = self._conversation_memory.to_records()
         if self.separate_proactive and self._pending_proactive is not None:
             payload["nene_pending_proactive"] = self._pending_proactive
-        temporary = self.path.with_suffix(".json.tmp")
-        temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        temporary.replace(self.path)
+        _atomic_write_json(self.path, payload)
 
     def clear(self) -> None:
         self._pending_proactive = None
