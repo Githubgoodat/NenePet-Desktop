@@ -12,6 +12,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from aipet.core.workflow_events import publish_hook_event
+from aipet.core.workflow_input_notices import publish_input_notice
 
 MAX_INPUT_BYTES = 64 * 1024
 
@@ -36,7 +37,16 @@ def main(argv: list[str] | None = None, *, stdin=None) -> int:
         if not isinstance(raw, bytes) or len(raw) > MAX_INPUT_BYTES:
             return 0
         payload = json.loads(raw)
-        publish_hook_event(args.inbox, payload)
+        # Lifecycle state may be replaced rapidly. Question notices have their
+        # own immutable identities so later running/Stop events cannot erase
+        # them before the desktop's next poll.
+        for projector in (publish_hook_event, publish_input_notice):
+            try:
+                projector(args.inbox, payload)
+            except Exception:
+                # One observation channel must not disable the other or
+                # interfere with Codex approval and execution.
+                pass
     except Exception:
         # An observer must not approve, reject, continue or interrupt Codex.
         pass

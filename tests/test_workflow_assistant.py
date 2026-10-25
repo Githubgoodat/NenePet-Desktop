@@ -3,8 +3,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import hashlib
 import os
 from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import Mock, patch
 
@@ -13,7 +15,8 @@ from PyQt5.QtCore import QObject, Qt, pyqtSignal
 from PyQt5.QtWidgets import QApplication
 
 from aipet.core.config import AppSettings
-from aipet.core.workflow_events import TaskSnapshot
+from aipet.core.workflow_events import TaskSnapshot, publish_hook_event
+from aipet.core.workflow_input_notices import InputNotice, publish_input_notice
 from aipet.ui.workflow_assistant import WorkflowController
 
 
@@ -41,6 +44,7 @@ class Pet(QObject):
         self.settings = AppSettings()
         self.settings.character.profile_id = "nene"
         self._closing = self._paused = False
+        self._test_mode = False
 
     def is_dnd_enabled(self):
         return self._paused
@@ -48,6 +52,9 @@ class Pet(QObject):
     def pause(self, value):
         self._paused = value
         self.pause_changed.emit(value)
+
+    def is_test_mode(self):
+        return self._test_mode
 
 
 class WorkflowTests(unittest.TestCase):
@@ -61,6 +68,7 @@ class WorkflowTests(unittest.TestCase):
         self.notices = []
         self.pet.notification.connect(lambda *value: self.notices.append(value))
         self.loader = Mock(return_value=())
+        self.input_loader = Mock(return_value=())
         self.controllers = []
 
     def tearDown(self):
@@ -72,7 +80,7 @@ class WorkflowTests(unittest.TestCase):
 
     def make(self):
         controller = WorkflowController(self.pet, inbox=Path("synthetic-inbox-do-not-create"),
-                                        clock=lambda: self.now, loader=self.loader)
+                                        clock=lambda: self.now, loader=self.loader, input_loader=self.input_loader)
         self.controllers.append(controller)
         return controller
 
@@ -81,6 +89,13 @@ class WorkflowTests(unittest.TestCase):
 
     def advance(self, seconds=1):
         self.now += timedelta(seconds=seconds)
+
+    def input_notice(self, *, identity="question-one", seconds=0, status="input_requested", **values):
+        return InputNotice(
+            notice_id=hashlib.sha256(identity.encode()).hexdigest(), task_id="fixture-session",
+            turn_id="fixture-turn", project=values.pop("project", "synthetic-project"),
+            status=status, observed_at=(self.now + timedelta(seconds=seconds)).isoformat(), **values,
+        )
 
     def test_startup_only_builds_baseline_and_never_claims_success(self):
         self.loader.return_value = (self.event(seconds=-2),)
@@ -300,6 +315,220 @@ class WorkflowTests(unittest.TestCase):
         controller.set_enabled(True)
         controller.shutdown()
         self.assertEqual(tracking, [False, True, False, True, False])
+
+    def test_durable_question_is_not_lost_when_running_overwrites_task_state_before_poll(self):
+        controller = self.make()
+        ready = []
+        controller.notification_ready.connect(ready.append)
+        self.advance()
+        question = self.input_notice()
+        self.advance(2)
+        self.loader.return_value = (self.event(event="PreToolUse", status="running"),)
+        self.input_loader.return_value = (question,)
+        controller.poll()
+        controller.poll()
+        self.assertEqual(ready, [question])
+        self.assertEqual(len(self.notices), 1)
+        self.assertIn("发起输入请求", self.notices[0][1])
+        self.assertIn("正在处理", controller.dialog.table.item(0, 3).text())
+        self.assertIn("不判断是否已回答", controller.dialog.input_summary.text())
+        self.assertEqual(controller.dialog.input_summary.textFormat(), Qt.PlainText)
+
+    def test_real_file_channels_keep_question_after_following_running_event(self):
+        with TemporaryDirectory(prefix="workflow-ui-input-") as temporary:
+            inbox = Path(temporary).resolve() / "synthetic-inbox"
+            controller = WorkflowController(self.pet, inbox=inbox, clock=lambda: self.now)
+            self.controllers.append(controller)
+            ready = []
+            controller.notification_ready.connect(ready.append)
+            payload = {
+                "hook_event_name": "PreToolUse", "session_id": "synthetic-ui-session",
+                "turn_id": "synthetic-ui-turn", "tool_use_id": "synthetic-ui-question",
+                "tool_name": "request_user_input_async", "cwd": "C:\\Synthetic\\UI Fixture",
+                "tool_input": {"questions": "PRIVATE QUESTION CONTENT"},
+            }
+            self.advance()
+            self.assertTrue(publish_hook_event(inbox, payload, now=self.now))
+            self.assertTrue(publish_input_notice(inbox, payload, now=self.now))
+            self.advance()
+            running = dict(payload, tool_name="Bash", tool_use_id="synthetic-following-tool")
+            self.assertTrue(publish_hook_event(inbox, running, now=self.now))
+            self.advance()
+            controller.poll()
+            controller.poll()
+            self.assertEqual(len(ready), 1)
+            self.assertIsInstance(ready[0], InputNotice)
+            self.assertEqual(ready[0].status, "question_opened")
+            self.assertIn("正在处理", controller.dialog.table.item(0, 3).text())
+            self.assertIn("可能仍在继续", self.notices[0][1])
+            self.assertNotIn("PRIVATE", str(self.notices))
+
+    def test_two_distinct_questions_at_same_time_are_independent_and_async_is_not_pause(self):
+        controller = self.make()
+        ready = []
+        controller.notification_ready.connect(ready.append)
+        self.advance()
+        sync = self.input_notice(identity="same-time-sync")
+        asynchronous = self.input_notice(identity="same-time-async", status="question_opened")
+        self.input_loader.return_value = (asynchronous, sync)
+        controller.poll()
+        controller.poll()
+        self.assertEqual({item.notice_id for item in ready}, {sync.notice_id, asynchronous.notice_id})
+        self.assertEqual(len(self.notices), 2)
+        async_text = next(body for _, body in self.notices if "可能仍在继续" in body)
+        self.assertNotIn("暂停", async_text)
+
+    def test_question_channel_is_notified_before_a_burst_of_turn_endings(self):
+        controller = self.make()
+        ready = []
+        controller.notification_ready.connect(ready.append)
+        self.advance()
+        question = self.input_notice(identity="before-turn-burst")
+        self.input_loader.return_value = (question,)
+        endings = tuple(self.event(task_id=f"ending-{index}") for index in range(6))
+        self.loader.return_value = endings
+        controller.poll()
+        self.assertEqual(ready[0], question)
+        self.assertEqual(ready[1:], list(endings))
+        self.assertEqual(controller.dialog.table.rowCount(), 6)
+
+    def test_question_startup_baseline_and_immutable_identity_prevent_replay(self):
+        old = self.input_notice(seconds=-1)
+        self.input_loader.return_value = (old,)
+        controller = self.make()
+        self.assertFalse(self.notices)
+        self.advance()
+        fresh = self.input_notice(identity="fresh")
+        self.input_loader.return_value = (fresh, old)
+        controller.poll()
+        self.advance()
+        changed_duplicate = self.input_notice(identity="fresh", status="question_opened")
+        self.input_loader.return_value = (changed_duplicate,)
+        controller.poll()
+        self.assertEqual(len(self.notices), 1)
+        self.assertEqual(controller._input_notices[fresh.notice_id], fresh)
+
+    def test_dnd_resume_questions_are_baselined_without_reads_or_backlog(self):
+        controller = self.make()
+        self.pet.pause(True)
+        reads = self.input_loader.call_count
+        self.advance()
+        self.input_loader.return_value = (self.input_notice(identity="during-dnd"),)
+        controller.poll()
+        self.assertEqual(self.input_loader.call_count, reads)
+        self.pet.pause(False)
+        self.assertFalse(self.notices)
+        self.advance()
+        self.input_loader.return_value += (self.input_notice(identity="after-dnd"),)
+        controller.poll()
+        self.assertEqual(len(self.notices), 1)
+
+    def test_pause_and_sustained_test_mode_do_not_read_questions_and_resume_is_quiet(self):
+        controller = self.make()
+        controller.set_enabled(False)
+        self.advance()
+        self.input_loader.return_value = (self.input_notice(identity="paused"),)
+        reads = self.input_loader.call_count
+        controller.poll()
+        self.assertEqual(self.input_loader.call_count, reads)
+        controller.set_enabled(True)
+        self.pet.test_mode_changed.emit(True)
+        self.assertFalse(controller.timer.isActive())
+        reads = self.input_loader.call_count
+        self.advance()
+        self.input_loader.return_value += (self.input_notice(identity="test-mode"),)
+        controller.poll()
+        self.assertEqual(self.input_loader.call_count, reads)
+        self.pet.test_mode_changed.emit(False)
+        self.assertFalse(self.notices)
+        self.assertTrue(controller.timer.isActive())
+        self.advance()
+        self.input_loader.return_value += (self.input_notice(identity="formal-after-test"),)
+        controller.poll()
+        self.assertEqual(len(self.notices), 1)
+
+    def test_question_reader_is_independent_when_lifecycle_reader_fails(self):
+        controller = self.make()
+        self.loader.side_effect = OSError("synthetic lifecycle unavailable")
+        self.advance()
+        self.input_loader.return_value = (self.input_notice(),)
+        controller.poll()
+        self.assertEqual(len(self.notices), 1)
+        self.assertIn("状态未知", controller.dialog.status.text())
+
+    def test_question_read_failure_preserves_seen_and_recovers_with_quiet_baseline(self):
+        controller = self.make()
+        self.advance()
+        first = self.input_notice()
+        self.input_loader.return_value = (first,)
+        controller.poll()
+        self.input_loader.side_effect = OSError("synthetic question unavailable")
+        self.advance()
+        controller.poll()
+        self.assertIn(first.notice_id, controller._input_seen)
+        self.assertIn("暂不可读", controller.dialog.input_summary.text())
+        missed = self.input_notice(identity="during-error")
+        self.input_loader.side_effect = None
+        self.advance()
+        self.input_loader.return_value = (first, missed)
+        controller.poll()
+        self.assertEqual(len(self.notices), 1)
+        self.advance()
+        self.input_loader.return_value += (self.input_notice(identity="after-error"),)
+        controller.poll()
+        self.assertEqual(len(self.notices), 2)
+
+    def test_delayed_independent_question_notices_are_delivered_once_without_regressing_summary(self):
+        controller = self.make()
+        self.advance()
+        older = self.input_notice(identity="older", project="older-project")
+        self.advance()
+        newer = self.input_notice(identity="newer", project="newer-project")
+        self.input_loader.return_value = (newer,)
+        controller.poll()
+        self.advance()
+        self.input_loader.return_value = (older, newer)
+        controller.poll()
+        self.assertEqual(len(self.notices), 2)
+        self.assertIn("newer-project", controller.dialog.input_summary.text())
+
+    def test_old_stale_unknown_and_future_question_notices_do_not_notify(self):
+        controller = self.make()
+        self.advance(3)
+        self.input_loader.return_value = (
+            self.input_notice(identity="before-watch", seconds=-4),
+            self.input_notice(identity="stale", seconds=-601),
+            self.input_notice(identity="unknown-source", source="unknown"),
+            self.input_notice(identity="unknown-state", status="unknown"),
+            self.input_notice(identity="future", seconds=20),
+        )
+        controller.poll()
+        self.assertFalse(self.notices)
+        self.assertEqual(len(controller._input_notices), 2)
+
+    def test_question_dedup_is_bounded_and_pruned_old_events_cannot_replay(self):
+        controller = self.make()
+        first = None
+        for index in range(270):
+            self.advance()
+            record = self.input_notice(identity=f"bounded-{index}")
+            first = first or record
+            self.input_loader.return_value = (record,)
+            controller.poll()
+        self.assertEqual(len(self.notices), 270)
+        self.assertLessEqual(len(controller._input_seen), 256)
+        self.input_loader.return_value = (first,)
+        controller.poll()
+        self.assertEqual(len(self.notices), 270)
+
+    def test_initial_test_mode_and_shutdown_do_not_read_question_channel(self):
+        self.pet._test_mode = True
+        controller = self.make()
+        self.input_loader.assert_not_called()
+        controller.shutdown()
+        controller.poll()
+        self.pet.test_mode_changed.emit(False)
+        self.input_loader.assert_not_called()
 
 
 if __name__ == "__main__":

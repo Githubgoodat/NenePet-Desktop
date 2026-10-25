@@ -31,13 +31,17 @@ _STATES = {
     "phase_ended": "阶段结束，待查看；这不代表整个任务完成。",
     "interrupted": "本轮已中断，请回任务来源确认。",
     "failed": "协作方上报失败，请回任务来源核对。",
+    "input_requested": "发起输入请求，请回 Codex 查看。",
+    "question_opened": "发起提问，任务可能仍在继续，请回 Codex 查看。",
 }
+_INPUT_STATES = {"input_requested", "question_opened"}
 _ERRORS = {
     "credentials_missing": "请先通过本人微信扫码确认登录。",
     "context_missing": "缺少本人上下文。请本人先给机器人发一句文字，再点“建立本人上下文”。",
     "session_expired": "微信登录已过期，请重新扫码登录；没有自动重试或补发。",
     "context_refresh_required": "请本人先给机器人再发一句文字，然后重新建立上下文。",
     "api_rejected": "微信服务未受理；请核对登录和本人上下文，不会自动重试。",
+    "api_rejected_minus2": "微信服务拒绝请求（-2），通知已暂停；原因尚不能确定。请先给机器人发一句话、重新建立本人上下文，再显式测试并启用。没有自动重试。",
     "network_error": "连接微信服务失败，请稍后显式重试；没有自动补发。",
     "bad_response": "微信服务返回了无法验证的结果，未认定发送成功。",
     "unsafe_url": "微信服务返回的地址未通过校验，已停止本次操作。",
@@ -53,6 +57,8 @@ def _utc_now():
 def notice_text(snapshot):
     source, state = _SOURCES.get(snapshot.source), _STATES.get(snapshot.status)
     if source is None or state is None or not isinstance(snapshot.task_id, str):
+        return None
+    if snapshot.status in _INPUT_STATES and snapshot.source != "codex":
         return None
     short_id = hashlib.sha256((snapshot.source + "\0" + snapshot.task_id).encode("utf-8")).hexdigest()[:10]
     return "宁宁 · AI任务提醒\n来源：" + source + "\n状态：" + state + "\n任务代号：" + short_id
@@ -215,6 +221,7 @@ class WeixinNotifyController(QObject):
         self._qr_renderer, self._qr_check = qr_renderer, qr_check
         self._closed = False
         self._paused = pet.is_dnd_enabled()
+        self._test_mode = bool(getattr(pet, "is_test_mode", lambda: False)())
         self._tracking = True
         self._enabled = False
         self._credentials = None
@@ -224,6 +231,9 @@ class WeixinNotifyController(QObject):
         self._workers = set()
         self._queue = deque()
         self._last_sent = {}
+        self._input_seen = {}
+        self._input_seen_before = None
+        self._input_watch_started = self._clock()
         self._qrcode = None
         self._qr_base = DEFAULT_BASE_URL
         self._qr_deadline = None
@@ -250,11 +260,11 @@ class WeixinNotifyController(QObject):
         d.logout.clicked.connect(self.clear_login)
         d.closing.connect(self._dialog_closed)
         pet.pause_changed.connect(self.set_paused)
-        pet.test_mode_changed.connect(self.cancel)
+        pet.test_mode_changed.connect(self.set_test_mode)
         self._set_status(self.status_text)
 
     def _interactive_allowed(self):
-        return (not self._closed and not self._paused and self._tracking
+        return (not self._closed and not self._paused and not self._test_mode and self._tracking
                 and not getattr(self.pet, "_closing", False)
                 and self.pet.settings.character.profile_id == "nene")
 
@@ -288,7 +298,8 @@ class WeixinNotifyController(QObject):
     def _job_error(self, operation, code):
         if operation in {"qr", "poll"}:
             self._poll_timer.stop()  # A failed poll requires an explicit retry.
-        if code in {"credentials_missing", "session_expired", "context_missing", "context_refresh_required"}:
+        if code in {"credentials_missing", "session_expired", "context_missing", "context_refresh_required",
+                    "api_rejected_minus2"}:
             self._enabled = False
             self._queue.clear()
             self.dialog.enabled.setChecked(False)
@@ -303,6 +314,7 @@ class WeixinNotifyController(QObject):
 
     def _invalidate(self):
         self._epoch += 1
+        self._input_watch_started = self._clock()
         self._queue.clear()
         self._poll_timer.stop()
         self._qrcode = None
@@ -455,24 +467,63 @@ class WeixinNotifyController(QObject):
         text = notice_text(snapshot)
         if text is None or snapshot.is_stale(now):
             return
-        key = (snapshot.source, snapshot.task_id, snapshot.status)
-        last = self._last_sent.get(key)
-        if last is not None and now - last < timedelta(seconds=30):
-            return
-        if len(self._queue) >= 4:
+        is_input = snapshot.status in _INPUT_STATES
+        if is_input:
+            notice_id = getattr(snapshot, "notice_id", None)
+            if snapshot.source != "codex" or not isinstance(notice_id, str) or not notice_id:
+                return
+            try:
+                observed = datetime.fromisoformat(snapshot.observed_at.replace("Z", "+00:00"))
+                if observed.tzinfo is None or observed > now:
+                    return
+            except (AttributeError, TypeError, ValueError):
+                return
+            if notice_id in self._input_seen or (
+                    observed <= self._input_watch_started or
+                    self._input_seen_before is not None and observed <= self._input_seen_before):
+                return
+            # Remember even a queue-full drop: this event must not be replayed
+            # later merely because a slot becomes available.
+            self._input_seen[notice_id] = observed
+            while len(self._input_seen) > 256:
+                oldest = min(self._input_seen, key=lambda value: (self._input_seen[value], value))
+                removed = self._input_seen.pop(oldest)
+                self._input_seen_before = max(self._input_seen_before or removed, removed)
+        else:
+            key = (snapshot.source, snapshot.task_id, snapshot.status)
+            last = self._last_sent.get(key)
+            if last is not None and now - last < timedelta(seconds=30):
+                return
+        critical = is_input or snapshot.status == "needs_attention"
+        ordinary_waiting = sum(not urgent for urgent, _ in self._queue)
+        if critical and len(self._queue) >= 4:
+            # A later input request may replace an ordinary pending update,
+            # but never an already submitted request or another input request.
+            ordinary = next((index for index in range(len(self._queue) - 1, -1, -1)
+                             if not self._queue[index][0]), None)
+            if ordinary is not None:
+                del self._queue[ordinary]
+        if len(self._queue) >= 4 or not critical and ordinary_waiting >= 3:
             self._set_status("微信提醒待发队列已满，本条已丢弃；不会之后补发。")
             return
-        self._last_sent[key] = now
-        if len(self._last_sent) > 256:
-            self._last_sent.pop(min(self._last_sent, key=self._last_sent.get))
-        self._queue.append(text)
+        if not is_input:
+            self._last_sent[key] = now
+            if len(self._last_sent) > 256:
+                self._last_sent.pop(min(self._last_sent, key=self._last_sent.get))
+        if critical:
+            # Keep FIFO among input/approval requests while placing them ahead
+            # of pending lifecycle endings. Four waiting items remains the cap.
+            position = sum(urgent for urgent, _ in self._queue)
+            self._queue.insert(position, (True, text))
+        else:
+            self._queue.append((False, text))
         self._drain()
 
     def _drain(self):
         if (not self._interactive_allowed() or not self._enabled or self._active is not None
                 or not self._queue or self._credentials is None or not self._context):
             return
-        text = self._queue.popleft()
+        _, text = self._queue.popleft()
         self._set_status("正在提交新的任务状态提醒……")
         self._start("send", (self._credentials, self._context, text), self._sent)
 
@@ -480,6 +531,7 @@ class WeixinNotifyController(QObject):
         if self._closed:
             return
         self._tracking = bool(enabled)
+        self._input_watch_started = self._clock()
         if not self._tracking:
             self._invalidate()
             self._set_status("任务跟进已暂停，微信待发提醒已清空；已经在途的请求无法撤回。")
@@ -490,11 +542,20 @@ class WeixinNotifyController(QObject):
         if self._closed:
             return
         self._paused = bool(paused)
+        self._input_watch_started = self._clock()
         if self._paused:
             self._invalidate()
             self._set_status("免打扰中：暂停微信请求并清空待发提醒；已经在途的请求无法撤回。")
         elif self._interactive_allowed():
             self._set_status("免打扰已解除；只等待之后的新事件，不补发旧提醒。")
+
+    def set_test_mode(self, enabled):
+        if self._closed:
+            return
+        self._test_mode = bool(enabled)
+        self._invalidate()
+        self._set_status("测试模式中：暂停微信任务提醒，恢复后不补发。" if self._test_mode
+                         else "已退出测试模式；只等待之后的新事件，不补发旧提醒。")
 
     def shutdown(self):
         if self._closed:
@@ -503,5 +564,6 @@ class WeixinNotifyController(QObject):
         self._invalidate()
         self._credentials = None
         self._context = self._cursor = ""
+        self._input_seen.clear()
         self.dialog.hide()
         self.dialog.setEnabled(False)

@@ -114,7 +114,14 @@ def _credentials(value: WeixinCredentials) -> WeixinCredentials:
 def _business(data: dict) -> None:
     for field in ("ret", "errcode"):
         if field in data and (type(data[field]) is not int or data[field] != 0):
-            code = "session_expired" if type(data[field]) is int and data[field] == -14 else "api_rejected"
+            if type(data[field]) is int and data[field] == -14:
+                code = "session_expired"
+            elif type(data[field]) is int and data[field] == -2:
+                # Preserve only the fixed service code, never arbitrary errmsg.
+                # Tencent does not document a unique cause for this rejection.
+                code = "api_rejected_minus2"
+            else:
+                code = "api_rejected"
             raise WeixinNotifyError(code)
 
 

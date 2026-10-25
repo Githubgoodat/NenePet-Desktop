@@ -159,6 +159,7 @@ class WeixinHTTPTests(unittest.TestCase):
 
     def test_unknown_or_failed_business_response_never_becomes_accepted(self):
         for data, code in (({}, "acceptance_unknown"), ({"ret": "0"}, "api_rejected"),
+                           ({"ret": -2, "errmsg": "TOKEN-SENTINEL PRIVATE-SENTINEL"}, "api_rejected_minus2"),
                            ({"ret": -14, "errmsg": "TOKEN-SENTINEL PRIVATE-SENTINEL"}, "session_expired"),
                            ({"ret": 0, "errcode": 71}, "api_rejected")):
             with self.subTest(data=data):

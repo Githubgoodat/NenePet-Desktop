@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
 import os
 from pathlib import Path
 import unittest
@@ -14,11 +15,13 @@ from PyQt5.QtWidgets import QApplication, QLineEdit
 
 from aipet.core.config import AppSettings
 from aipet.core.workflow_events import TaskSnapshot
+from aipet.core.workflow_input_notices import InputNotice
 from aipet.core.weixin_notify import (
     DEFAULT_BASE_URL, WeixinConfig, WeixinCredentials, WeixinNotifyError,
     WeixinQRCode, WeixinQRResult, WeixinSendResult, WeixinUpdate,
 )
 from aipet.ui.weixin_notify import WeixinNotifyController, WeixinWorker, notice_text, qr_available, render_qr
+from aipet.ui.workflow_assistant import WorkflowController
 
 
 CREDS = WeixinCredentials("synthetic-bot-token", "fixture-bot", "fixture-owner", DEFAULT_BASE_URL)
@@ -27,12 +30,14 @@ CREDS = WeixinCredentials("synthetic-bot-token", "fixture-bot", "fixture-owner",
 class Pet(QObject):
     pause_changed = pyqtSignal(bool)
     test_mode_changed = pyqtSignal(bool)
+    notification = pyqtSignal(str, str)
 
     def __init__(self):
         super().__init__()
         self.settings = AppSettings()
         self.settings.character.profile_id = "nene"
         self._closing = self._paused = False
+        self._test_mode = False
 
     def is_dnd_enabled(self):
         return self._paused
@@ -40,6 +45,9 @@ class Pet(QObject):
     def pause(self, value):
         self._paused = value
         self.pause_changed.emit(value)
+
+    def is_test_mode(self):
+        return self._test_mode
 
 
 class FakeWorker(QObject):
@@ -106,6 +114,13 @@ class WeixinUiTests(unittest.TestCase):
     def snapshot(self, *, task="fixture-task", status="needs_attention", source="codex", seconds=0):
         return TaskSnapshot(task, source, "private-project-name-must-not-leave", "FixtureEvent", status,
                             (self.now + timedelta(seconds=seconds)).isoformat(), "fixture-turn")
+
+    def input_notice(self, *, identity="question-one", status="input_requested", seconds=0, source="codex"):
+        return InputNotice(
+            notice_id=hashlib.sha256(identity.encode()).hexdigest(), task_id="private-input-task-id",
+            turn_id="private-turn-id", project="private-question-project", status=status, source=source,
+            observed_at=(self.now + timedelta(seconds=seconds)).isoformat(),
+        )
 
     def test_default_disabled_initialization_does_not_start_network_or_save(self):
         controller = self.make()
@@ -187,6 +202,22 @@ class WeixinUiTests(unittest.TestCase):
         self.assertEqual(controller._context, "")
         self.assertEqual(controller._cursor, "new-cursor")
         self.assertIn("尚未收到", controller.status_text)
+
+    def test_minus_two_rejection_pauses_sends_without_erasing_binding_or_guessing_expiry(self):
+        controller = self.make(enabled=True)
+        controller.enqueue(self.snapshot())
+        controller.enqueue(self.snapshot(task="pending-before-rejection"))
+        self.assertTrue(controller._queue)
+        controller._job_error("send", "api_rejected_minus2")
+        self.assertFalse(controller._enabled)
+        self.assertFalse(controller.dialog.enabled.isChecked())
+        self.assertFalse(controller._queue)
+        self.assertEqual(controller._credentials, CREDS)
+        self.assertIn("-2", controller.status_text)
+        self.assertNotIn("登录已过期", controller.status_text)
+        controller.enqueue(self.snapshot(task="after-rejection"))
+        self.assertEqual(len(self.jobs), 1)
+        self.save.assert_not_called()
 
     def test_task_notice_contains_only_fixed_source_state_and_hash(self):
         record = self.snapshot(task="sensitive-id-do-not-send", source="grok_bot", status="phase_ended")
@@ -307,6 +338,176 @@ class WeixinUiTests(unittest.TestCase):
         self.assertFalse(pixmap.isNull())
         self.assertLessEqual(pixmap.width(), 330)
         self.assertEqual(pixmap.width(), pixmap.height())
+
+    def test_input_notice_text_is_fixed_and_async_does_not_claim_pause(self):
+        for status in ("input_requested", "question_opened"):
+            with self.subTest(status=status):
+                record = self.input_notice(status=status)
+                text = notice_text(record)
+                self.assertIn("Codex", text)
+                for private in (record.task_id, record.turn_id, record.project, record.notice_id):
+                    self.assertNotIn(private, text)
+                self.assertNotIn("暂停", text)
+        self.assertIn("可能仍在继续", notice_text(self.input_notice(status="question_opened")))
+        self.assertIsNone(notice_text(self.input_notice(source="grok_bot")))
+
+    def test_distinct_questions_bypass_task_rate_limit_but_same_notice_never_replays(self):
+        controller = self.make(enabled=True)
+        self.now += timedelta(seconds=1)
+        first = self.input_notice(identity="first")
+        second = self.input_notice(identity="second")
+        controller.enqueue(first)
+        controller.enqueue(first)
+        controller.enqueue(second)
+        self.assertEqual(len(self.jobs), 1)
+        self.assertEqual(len(controller._queue), 1)
+        self.jobs[0].complete(WeixinSendResult(True))
+        self.assertEqual(len(self.jobs), 2)
+        self.jobs[1].complete(WeixinSendResult(True))
+        self.now += timedelta(seconds=31)
+        controller.enqueue(first)
+        controller.enqueue(second)
+        self.assertEqual(len(self.jobs), 2)
+
+    def test_input_notice_missing_identity_unknown_source_stale_or_future_do_not_send(self):
+        controller = self.make(enabled=True)
+        self.now += timedelta(seconds=1)
+        for record in (
+                self.snapshot(status="input_requested"),
+                self.input_notice(source="grok_bot"),
+                self.input_notice(identity="stale", seconds=-601),
+                self.input_notice(identity="future", seconds=1)):
+            controller.enqueue(record)
+        self.assertFalse(self.jobs)
+
+    def test_question_queue_remains_bounded_and_full_drop_is_not_replayed(self):
+        controller = self.make(enabled=True)
+        self.now += timedelta(seconds=1)
+        records = [self.input_notice(identity=f"queued-{index}") for index in range(6)]
+        for record in records:
+            controller.enqueue(record)
+        self.assertEqual(len(self.jobs), 1)
+        self.assertEqual(len(controller._queue), 4)
+        self.assertIn("队列已满", controller.status_text)
+        self.jobs[0].complete(WeixinSendResult(True))
+        self.assertEqual(len(self.jobs), 2)
+        queued = len(controller._queue)
+        controller.enqueue(records[-1])
+        self.assertEqual(len(controller._queue), queued)
+
+    def test_ordinary_endings_reserve_one_slot_for_input_and_approval_goes_next(self):
+        controller = self.make(enabled=True)
+        controller.enqueue(self.snapshot(task="active-ending", status="turn_ended"))
+        for index in range(5):
+            controller.enqueue(self.snapshot(task=f"ordinary-{index}", status="phase_ended"))
+        self.assertEqual(len(controller._queue), 3)
+        self.now += timedelta(seconds=1)
+        question = self.input_notice(identity="reserved-input")
+        controller.enqueue(question)
+        self.assertEqual(len(controller._queue), 4)
+        self.jobs[0].complete(WeixinSendResult(True))
+        self.assertEqual(self.jobs[1].arguments[-1], notice_text(question))
+        approval = self.snapshot(task="reserved-approval", status="needs_attention")
+        controller.enqueue(approval)
+        self.assertEqual(len(controller._queue), 4)
+        self.jobs[1].complete(WeixinSendResult(True))
+        self.assertEqual(self.jobs[2].arguments[-1], notice_text(approval))
+
+    def test_critical_requests_displace_ordinary_updates_and_keep_fifo_order(self):
+        controller = self.make(enabled=True)
+        controller.enqueue(self.snapshot(task="active-ending", status="turn_ended"))
+        for index in range(3):
+            controller.enqueue(self.snapshot(task=f"ordinary-{index}", status="turn_ended"))
+        self.now += timedelta(seconds=1)
+        first = self.input_notice(identity="first-priority")
+        second = self.input_notice(identity="second-priority", status="question_opened")
+        third = self.snapshot(task="third-priority", status="needs_attention")
+        for record in (first, second, third):
+            controller.enqueue(record)
+            self.assertLessEqual(len(controller._queue), 4)
+        for index, record in enumerate((first, second, third)):
+            self.jobs[index].complete(WeixinSendResult(True))
+            self.assertEqual(self.jobs[index + 1].arguments[-1], notice_text(record))
+
+    def test_all_critical_pending_queue_is_bounded_and_new_drop_never_replays(self):
+        controller = self.make(enabled=True)
+        self.now += timedelta(seconds=1)
+        records = [self.input_notice(identity=f"all-critical-{index}") for index in range(6)]
+        for record in records:
+            controller.enqueue(record)
+        self.assertEqual(len(self.jobs), 1)
+        self.assertEqual(len(controller._queue), 4)
+        self.assertTrue(all(critical for critical, _ in controller._queue))
+        self.jobs[0].complete(WeixinSendResult(True))
+        queued = len(controller._queue)
+        controller.enqueue(records[-1])
+        self.assertEqual(len(controller._queue), queued)
+        self.assertEqual(len(self.jobs), 2)
+
+    def test_workflow_poll_burst_keeps_input_slot_and_sends_it_before_endings(self):
+        phone = self.make(enabled=True)
+        phone.enqueue(self.snapshot(task="already-sending", status="turn_ended"))
+        for index in range(3):
+            phone.enqueue(self.snapshot(task=f"already-pending-{index}", status="phase_ended"))
+        lifecycle = Mock(return_value=())
+        questions = Mock(return_value=())
+        workflow = WorkflowController(self.pet, inbox=Path("synthetic-ui-inbox"),
+                                      clock=lambda: self.now, loader=lifecycle, input_loader=questions)
+        self.controllers.append(workflow)
+        workflow.notification_ready.connect(phone.enqueue)
+        self.now += timedelta(seconds=1)
+        question = self.input_notice(identity="same-poll-question", status="question_opened")
+        questions.return_value = (question,)
+        lifecycle.return_value = tuple(self.snapshot(task=f"new-ending-{index}", status="turn_ended")
+                                      for index in range(6))
+        workflow.poll()
+        self.assertEqual(len(phone._queue), 4)
+        self.assertEqual(workflow.dialog.table.rowCount(), 6)
+        self.jobs[0].complete(WeixinSendResult(True))
+        self.assertEqual(self.jobs[1].arguments[-1], notice_text(question))
+        self.assertIn("可能仍在继续", self.jobs[1].arguments[-1])
+
+    def test_pause_tracking_and_test_mode_cut_off_question_replay_after_resume(self):
+        controller = self.make(enabled=True)
+        transitions = (
+            (lambda: self.pet.pause(True), lambda: self.pet.pause(False)),
+            (lambda: controller.set_tracking(False), lambda: controller.set_tracking(True)),
+            (lambda: self.pet.test_mode_changed.emit(True), lambda: self.pet.test_mode_changed.emit(False)),
+        )
+        for index, (pause, resume) in enumerate(transitions):
+            pause()
+            self.now += timedelta(seconds=1)
+            record = self.input_notice(identity=f"during-pause-{index}")
+            controller.enqueue(record)
+            resume()
+            controller.enqueue(record)
+        self.assertFalse(self.jobs)
+        self.now += timedelta(seconds=1)
+        controller.enqueue(self.input_notice(identity="fresh-after-resume"))
+        self.assertEqual(len(self.jobs), 1)
+
+    def test_input_dedup_memory_is_bounded_without_replaying_pruned_fresh_id(self):
+        controller = self.make(enabled=True)
+        first = None
+        for index in range(270):
+            self.now += timedelta(seconds=1)
+            record = self.input_notice(identity=f"bounded-{index}")
+            first = first or record
+            controller.enqueue(record)
+            self.jobs[-1].complete(WeixinSendResult(True))
+        self.assertEqual(len(self.jobs), 270)
+        self.assertLessEqual(len(controller._input_seen), 256)
+        controller.enqueue(first)
+        self.assertEqual(len(self.jobs), 270)
+
+    def test_initial_test_mode_prevents_task_phone_jobs(self):
+        self.pet._test_mode = True
+        controller = self.make(enabled=True)
+        self.now += timedelta(seconds=1)
+        controller.enqueue(self.input_notice())
+        controller.enqueue(self.snapshot())
+        controller.send_test()
+        self.assertFalse(self.jobs)
 
 
 class WeixinWorkerTests(unittest.TestCase):
