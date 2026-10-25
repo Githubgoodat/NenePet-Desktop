@@ -437,7 +437,7 @@ class WeixinUiTests(unittest.TestCase):
             controller.enqueue(record)
         self.assertEqual(len(self.jobs), 1)
         self.assertEqual(len(controller._queue), 4)
-        self.assertTrue(all(critical for critical, _ in controller._queue))
+        self.assertTrue(all(critical for critical, _, _ in controller._queue))
         self.jobs[0].complete(WeixinSendResult(True))
         queued = len(controller._queue)
         controller.enqueue(records[-1])
@@ -508,6 +508,122 @@ class WeixinUiTests(unittest.TestCase):
         controller.enqueue(self.snapshot())
         controller.send_test()
         self.assertFalse(self.jobs)
+
+    def test_can_send_automatic_requires_enabled_binding_context_and_active_mode(self):
+        controller = self.make(enabled=True)
+        self.assertTrue(controller.can_send_automatic())
+        controller._context = ""
+        self.assertFalse(controller.can_send_automatic())
+        controller._context = "synthetic-context"
+        controller._credentials = None
+        self.assertFalse(controller.can_send_automatic())
+        controller._credentials = CREDS
+        self.pet.pause(True)
+        self.assertFalse(controller.can_send_automatic())
+        self.pet.pause(False)
+        self.pet.test_mode_changed.emit(True)
+        self.assertFalse(controller.can_send_automatic())
+        self.pet.test_mode_changed.emit(False)
+        controller.set_tracking(False)
+        self.assertFalse(controller.can_send_automatic())
+        controller.set_tracking(True)
+        controller._enabled = False
+        self.assertFalse(controller.can_send_automatic())
+        controller.shutdown()
+        self.assertFalse(controller.can_send_automatic())
+
+    def test_definitive_automatic_failure_routes_failed_and_pending_after_pausing(self):
+        for code in ("api_rejected_minus2", "api_rejected", "session_expired", "context_missing",
+                     "credentials_missing", "context_refresh_required"):
+            with self.subTest(code=code):
+                controller = self.make(enabled=True)
+                handed = []
+                controller.automatic_notice_failed.connect(
+                    lambda record, c=controller: handed.append((record, c.can_send_automatic()))
+                )
+                first = self.snapshot(task="failed-" + code)
+                second = self.snapshot(task="pending-" + code)
+                controller.enqueue(first)
+                active = self.jobs[-1]
+                controller.enqueue(second)
+                active.fail(code)
+                self.assertEqual(handed, [(first, False), (second, False)])
+                self.assertFalse(controller._queue)
+                self.assertIsNone(controller._active_auto_notice)
+                self.assertFalse(controller._enabled)
+
+    def test_ambiguous_failure_does_not_hand_off_or_repeat_that_notice(self):
+        for code in ("acceptance_unknown", "network_error", "bad_response"):
+            with self.subTest(code=code):
+                controller = self.make(enabled=True)
+                handed = []
+                controller.automatic_notice_failed.connect(handed.append)
+                controller.enqueue(self.snapshot(task="unknown-" + code))
+                job = self.jobs[-1]
+                before = len(self.jobs)
+                job.fail(code)
+                self.assertEqual(handed, [])
+                self.assertEqual(len(self.jobs), before)
+                self.assertTrue(controller._enabled)
+                self.assertIsNone(controller._active_auto_notice)
+
+    def test_manual_test_and_late_definitive_failure_are_not_handed_off(self):
+        controller = self.make(enabled=True)
+        handed = []
+        controller.automatic_notice_failed.connect(handed.append)
+        controller.send_test()
+        self.assertIsNone(controller._active_auto_notice)
+        self.jobs[-1].fail("api_rejected")
+        self.assertFalse(handed)
+        other = self.make(enabled=True)
+        other.automatic_notice_failed.connect(handed.append)
+        other.enqueue(self.snapshot(task="canceled-before-failure"))
+        job = self.jobs[-1]
+        self.pet.pause(True)
+        job.fail("api_rejected_minus2")
+        self.assertFalse(handed)
+        self.assertIsNone(other._active_auto_notice)
+
+    def test_handoff_prioritizes_queued_input_and_manual_test_has_no_old_auto_record(self):
+        controller = self.make(enabled=True)
+        handed = []
+        controller.automatic_notice_failed.connect(handed.append)
+        ordinary = self.snapshot(task="ordinary-failed", status="phase_ended")
+        controller.enqueue(ordinary)
+        active = self.jobs[-1]
+        self.now += timedelta(seconds=1)
+        question = self.input_notice(identity="pending-critical")
+        controller.enqueue(question)
+        active.fail("api_rejected")
+        self.assertEqual(handed, [question, ordinary])
+        other = self.make(enabled=True)
+        other.automatic_notice_failed.connect(handed.append)
+        other.enqueue(self.snapshot(task="successful-auto"))
+        self.jobs[-1].complete(WeixinSendResult(True))
+        self.assertIsNone(other._active_auto_notice)
+        before = len(handed)
+        other.send_test()
+        self.jobs[-1].fail("api_rejected")
+        self.assertEqual(len(handed), before)
+
+    def test_stop_tracking_and_shutdown_suppress_late_failure_transfer(self):
+        for stop in ("tracking", "test", "cancel", "shutdown"):
+            with self.subTest(stop=stop):
+                controller = self.make(enabled=True)
+                handed = []
+                controller.automatic_notice_failed.connect(handed.append)
+                controller.enqueue(self.snapshot(task="late-" + stop))
+                job = self.jobs[-1]
+                if stop == "tracking":
+                    controller.set_tracking(False)
+                elif stop == "test":
+                    controller.set_test_mode(True)
+                elif stop == "cancel":
+                    controller.cancel()
+                else:
+                    controller.shutdown()
+                job.fail("api_rejected")
+                self.assertFalse(handed)
 
 
 class WeixinWorkerTests(unittest.TestCase):

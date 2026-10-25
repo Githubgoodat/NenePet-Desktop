@@ -29,3 +29,7 @@ AIpet-Murasame 的[上游说明](https://github.com/kuxiaowo/AIpet-Murasame/blob
 ## 微信通知协议参考
 
 微信纯文本通知适配器参考腾讯开源的 **[Tencent/openclaw-weixin](https://github.com/Tencent/openclaw-weixin)** 中的[协议说明](https://github.com/Tencent/openclaw-weixin/blob/main/docs/protocol.md)及扫码、消息请求实现，保留 [Tencent MIT 许可](licenses/weixin/LICENSE-Tencent-MIT.txt)。本项目的轻量适配器不是腾讯提供的独立 SDK，也不是 DeepSeek 官方微信 skill；未附带 OpenClaw 或社区 Harness 插件。对话模型与微信传输分开，发送固定任务状态不需要新的模型请求。
+
+## iPhone 备用通知协议参考
+
+Bark 备用通知适配器依据 **[Finb/Bark](https://github.com/Finb/Bark)** 的[公开推送 API](https://github.com/Finb/Bark/blob/master/docs/tutorial.md)和 **[Finb/bark-server](https://github.com/Finb/bark-server)** 的响应约定独立实现。感谢这些开源项目提供接口与文档。Bark 手机 App 和公共推送服务为独立项目，本仓库未附带其客户端或服务器代码，也不宣称官方背书。密钥仅在本机加密保存，请求通过 HTTPS 发送固定状态元数据。

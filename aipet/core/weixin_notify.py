@@ -113,7 +113,11 @@ def _credentials(value: WeixinCredentials) -> WeixinCredentials:
 
 def _business(data: dict) -> None:
     for field in ("ret", "errcode"):
-        if field in data and (type(data[field]) is not int or data[field] != 0):
+        if field in data and type(data[field]) is not int:
+            # Malformed/ambiguous replies are not explicit service rejection.
+            # In particular, they must not cause a second-channel resend.
+            raise WeixinNotifyError("bad_response")
+        if field in data and data[field] != 0:
             if type(data[field]) is int and data[field] == -14:
                 code = "session_expired"
             elif type(data[field]) is int and data[field] == -2:

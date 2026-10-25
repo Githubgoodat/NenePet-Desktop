@@ -158,7 +158,8 @@ class WeixinHTTPTests(unittest.TestCase):
         self.assertEqual(message["item_list"], [{"type": 1, "text_item": {"text": "Phase ended; inspect the result."}}])
 
     def test_unknown_or_failed_business_response_never_becomes_accepted(self):
-        for data, code in (({}, "acceptance_unknown"), ({"ret": "0"}, "api_rejected"),
+        for data, code in (({}, "acceptance_unknown"), ({"ret": "0"}, "bad_response"),
+                           ({"ret": True}, "bad_response"), ({"ret": 0, "errcode": "0"}, "bad_response"),
                            ({"ret": -2, "errmsg": "TOKEN-SENTINEL PRIVATE-SENTINEL"}, "api_rejected_minus2"),
                            ({"ret": -14, "errmsg": "TOKEN-SENTINEL PRIVATE-SENTINEL"}, "session_expired"),
                            ({"ret": 0, "errcode": 71}, "api_rejected")):

@@ -35,6 +35,10 @@ _STATES = {
     "question_opened": "发起提问，任务可能仍在继续，请回 Codex 查看。",
 }
 _INPUT_STATES = {"input_requested", "question_opened"}
+_DEFINITIVE_FAILURES = {
+    "api_rejected_minus2", "api_rejected", "session_expired", "context_missing",
+    "credentials_missing", "context_refresh_required",
+}
 _ERRORS = {
     "credentials_missing": "请先通过本人微信扫码确认登录。",
     "context_missing": "缺少本人上下文。请本人先给机器人发一句文字，再点“建立本人上下文”。",
@@ -210,6 +214,7 @@ class WeixinDialog(QDialog):
 
 class WeixinNotifyController(QObject):
     status_changed = pyqtSignal(str)
+    automatic_notice_failed = pyqtSignal(object)
 
     def __init__(self, pet, parent=None, *, config_path=None, worker_factory=WeixinWorker,
                  clock=_utc_now, qr_renderer=render_qr, qr_check=qr_available, dialog=None):
@@ -228,6 +233,7 @@ class WeixinNotifyController(QObject):
         self._context = self._cursor = ""
         self._epoch = 0
         self._active = None
+        self._active_auto_notice = None
         self._workers = set()
         self._queue = deque()
         self._last_sent = {}
@@ -268,6 +274,10 @@ class WeixinNotifyController(QObject):
                 and not getattr(self.pet, "_closing", False)
                 and self.pet.settings.character.profile_id == "nene")
 
+    def can_send_automatic(self):
+        return bool(self._enabled and self._interactive_allowed()
+                    and self._credentials is not None and self._context)
+
     def _set_status(self, text):
         self.status_text = text
         self.dialog.status.setText(text)
@@ -280,13 +290,14 @@ class WeixinNotifyController(QObject):
         self.dialog.raise_()
         self.dialog.activateWindow()
 
-    def _start(self, operation, arguments, callback):
+    def _start(self, operation, arguments, callback, *, auto_notice=None):
         if not self._interactive_allowed() or self._active is not None:
             return False
         epoch = self._epoch
         worker = self._factory(operation, arguments, parent=self)
         self._workers.add(worker)
         self._active = worker
+        self._active_auto_notice = auto_notice
         worker.result_ready.connect(lambda value: callback(value) if epoch == self._epoch
                                     and self._interactive_allowed() else None)
         worker.error.connect(lambda code: self._job_error(operation, code)
@@ -296,19 +307,34 @@ class WeixinNotifyController(QObject):
         return True
 
     def _job_error(self, operation, code):
+        failed = []
         if operation in {"qr", "poll"}:
             self._poll_timer.stop()  # A failed poll requires an explicit retry.
-        if code in {"credentials_missing", "session_expired", "context_missing", "context_refresh_required",
-                    "api_rejected_minus2"}:
+        if code in _DEFINITIVE_FAILURES:
+            if operation == "send" and self._active_auto_notice is not None:
+                failed.append(self._active_auto_notice)
+            failed.extend(record for _, _, record in self._queue)
+            # Pause this runtime before routing failed automatic notices. Do
+            # not guess that a timeout/unknown response was never delivered.
             self._enabled = False
             self._queue.clear()
+            self._active_auto_notice = None
+            self._epoch += 1
             self.dialog.enabled.setChecked(False)
         self._set_status(_ERRORS.get(code, _ERRORS["bad_response"]))
+        if self._interactive_allowed():
+            failed.sort(key=lambda record: record.status not in _INPUT_STATES
+                        and record.status != "needs_attention")
+            for record in failed:
+                if not self._interactive_allowed():
+                    break
+                self.automatic_notice_failed.emit(record)
 
     def _retire(self, worker):
         self._workers.discard(worker)
         if self._active is worker:
             self._active = None
+            self._active_auto_notice = None
         worker.deleteLater()
         self._drain()
 
@@ -316,6 +342,7 @@ class WeixinNotifyController(QObject):
         self._epoch += 1
         self._input_watch_started = self._clock()
         self._queue.clear()
+        self._active_auto_notice = None
         self._poll_timer.stop()
         self._qrcode = None
         self.dialog.qr.clear()
@@ -495,7 +522,7 @@ class WeixinNotifyController(QObject):
             if last is not None and now - last < timedelta(seconds=30):
                 return
         critical = is_input or snapshot.status == "needs_attention"
-        ordinary_waiting = sum(not urgent for urgent, _ in self._queue)
+        ordinary_waiting = sum(not urgent for urgent, _, _ in self._queue)
         if critical and len(self._queue) >= 4:
             # A later input request may replace an ordinary pending update,
             # but never an already submitted request or another input request.
@@ -513,19 +540,19 @@ class WeixinNotifyController(QObject):
         if critical:
             # Keep FIFO among input/approval requests while placing them ahead
             # of pending lifecycle endings. Four waiting items remains the cap.
-            position = sum(urgent for urgent, _ in self._queue)
-            self._queue.insert(position, (True, text))
+            position = sum(urgent for urgent, _, _ in self._queue)
+            self._queue.insert(position, (True, text, snapshot))
         else:
-            self._queue.append((False, text))
+            self._queue.append((False, text, snapshot))
         self._drain()
 
     def _drain(self):
         if (not self._interactive_allowed() or not self._enabled or self._active is not None
                 or not self._queue or self._credentials is None or not self._context):
             return
-        _, text = self._queue.popleft()
+        _, text, record = self._queue.popleft()
         self._set_status("正在提交新的任务状态提醒……")
-        self._start("send", (self._credentials, self._context, text), self._sent)
+        self._start("send", (self._credentials, self._context, text), self._sent, auto_notice=record)
 
     def set_tracking(self, enabled):
         if self._closed:

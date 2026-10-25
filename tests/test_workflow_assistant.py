@@ -113,6 +113,9 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn(str(controller.inbox), controller.dialog.inbox_path.text())
         self.assertTrue(controller.dialog.inbox_path.textInteractionFlags() & Qt.TextSelectableByMouse)
         self.assertEqual(controller.dialog.inbox_path.textFormat(), Qt.PlainText)
+        self.assertEqual(controller.dialog.bark.text(), "iPhone备用提醒…")
+        self.assertEqual(controller.dialog.bark_status.textFormat(), Qt.PlainText)
+        self.assertIn("未启用", controller.dialog.bark_status.text())
 
     def test_new_attention_and_turn_end_are_notified_once(self):
         controller = self.make()
