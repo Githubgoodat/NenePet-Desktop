@@ -1,12 +1,14 @@
 """Opt-in direct WeChat task notices; QR login and every test are explicit.
 
 This client accepts only the scanner's context from the separate core adapter.
-It never turns phone messages into commands, approvals, or model prompts.
+The separate, explicitly enabled question channel can deliver coded ordinary
+answers to their registered executor. It never approves actions or runs text.
 """
 from __future__ import annotations
 
 from collections import deque
 from datetime import datetime, timedelta, timezone
+import hashlib
 import importlib
 from pathlib import Path, PureWindowsPath
 import re
@@ -53,6 +55,9 @@ _ERRORS = {
     "api_rejected": "微信服务未受理；请核对登录和本人上下文，不会自动重试。",
     "api_rejected_minus2": "微信服务拒绝请求（-2），通知已暂停；原因尚不能确定。请先给机器人发一句话、重新建立本人上下文，再显式测试并启用。没有自动重试。",
     "network_error": "连接微信服务失败，请稍后显式重试；没有自动补发。",
+    "poll_connect_timeout": "微信接收连接超时，保留游标后稍后重查。",
+    "poll_tls_error": "微信接收安全连接失败，保留游标后稍后重查。",
+    "poll_connection_error": "微信接收网络连接失败，保留游标后稍后重查。",
     "bad_response": "微信服务返回了无法验证的结果，未认定发送成功。",
     "unsafe_url": "微信服务返回的地址未通过校验，已停止本次操作。",
     "config_error": "本机微信设置无法读取或安全保存，提醒保持关闭。",
@@ -177,7 +182,9 @@ class WeixinWorker(QThread):
                 result = client.poll_qr(self.arguments[0], base_url=self.arguments[1])
             elif self.operation == "context":
                 result = client.get_updates(self.arguments[0], cursor=self.arguments[1])
-            elif self.operation == "send":
+            elif self.operation == "replies":
+                result = client.get_reply_updates(self.arguments[0], cursor=self.arguments[1])
+            elif self.operation in {"send", "question_send"}:
                 result = client.send_notice(*self.arguments)
             else:
                 return
@@ -254,6 +261,10 @@ class WeixinDialog(QDialog):
 class WeixinNotifyController(QObject):
     status_changed = pyqtSignal(str)
     automatic_notice_failed = pyqtSignal(object)
+    question_replies = pyqtSignal(object, str)
+    question_send_result = pyqtSignal(str)
+    question_transport_error = pyqtSignal(str)
+    slot_available = pyqtSignal()
 
     def __init__(self, pet, parent=None, *, config_path=None, worker_factory=WeixinWorker,
                  clock=_utc_now, qr_renderer=render_qr, qr_check=qr_available, dialog=None):
@@ -268,10 +279,21 @@ class WeixinNotifyController(QObject):
         self._test_mode = bool(getattr(pet, "is_test_mode", lambda: False)())
         self._tracking = True
         self._enabled = False
+        self._saved_enabled = False
+        self._questions_enabled = False
+        self._question_epoch = 0
+        self._question_fault = False
+        self._bootstrap_ready = False
+        self._receive_retry_at = self._clock()
+        self._question_update_deferred = False
+        self._context_refresh_pending = False
         self._credentials = None
+        self._binding_committed = False
         self._context = self._cursor = ""
         self._epoch = 0
+        self._send_epoch = 0
         self._active = None
+        self._reply_active = None
         self._active_auto_notice = None
         self._workers = set()
         self._queue = deque()
@@ -285,11 +307,16 @@ class WeixinNotifyController(QObject):
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(2_000)
         self._poll_timer.timeout.connect(self.check_login)
+        self._question_timer = QTimer(self)
+        self._question_timer.setInterval(1_000)
+        self._question_timer.timeout.connect(self.poll_question_replies)
         self.status_text = "微信提醒未启用；仅显式扫码登录或发送测试时访问服务。"
         try:
             config = load_config(self.config_path)
             self._credentials, self._context, self._cursor = config.credentials, config.context_token, config.cursor
+            self._binding_committed = self._credentials is not None
             self._enabled = bool(config.enabled and self._credentials and self._context)
+            self._saved_enabled = config.enabled
             if self._enabled:
                 self.status_text = "微信提醒已启用，仅等待后续新的任务状态事件。"
         except Exception:
@@ -317,6 +344,98 @@ class WeixinNotifyController(QObject):
         return bool(self._enabled and self._interactive_allowed()
                     and self._credentials is not None and self._context)
 
+    def question_owner_key(self):
+        if self._credentials is None or not self._binding_committed:
+            return ""
+        value = self._credentials.bot_id + "\0" + self._credentials.scanner_id
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    def question_channel_available(self):
+        return bool(self._interactive_allowed() and self._credentials is not None
+                    and self._binding_committed and self._bootstrap_ready
+                    and self._context and not self._question_fault and not self._qrcode
+                    and (self._active is None or self._active.operation not in {"qr", "poll"}))
+
+    def set_question_channel(self, enabled):
+        enabled = bool(enabled)
+        if self._questions_enabled and not enabled:
+            self._question_epoch += 1
+            self._bootstrap_ready = False
+            if self._reply_active is not None:
+                self._reply_active.cancel()
+            if self._active is not None and self._active.operation == "question_send":
+                self._active.cancel()
+        self._questions_enabled = enabled
+        if self._questions_enabled and self._interactive_allowed() and not self._question_fault:
+            self._question_timer.start()
+        else:
+            self._question_timer.stop()
+
+    def retry_question_channel(self):
+        self._question_fault = False
+        self._bootstrap_ready = False
+        self._receive_retry_at = self._clock()
+        self.set_question_channel(self._questions_enabled)
+
+    def can_send_question(self):
+        return bool(self._questions_enabled and self.question_channel_available()
+                    and self._context and self._active is None and not self._queue)
+
+    def send_question_notice(self, text):
+        if not self.can_send_question() or not isinstance(text, str) or not 0 < len(text) <= 2000:
+            return False
+        return self._start("question_send", (self._credentials, self._context, text),
+                           lambda result: self.question_send_result.emit(
+                               "accepted" if result.accepted else "acceptance_unknown"))
+
+    def poll_question_replies(self):
+        if (not self._questions_enabled or not self._interactive_allowed()
+                or self._credentials is None or self._question_fault
+                or not self._binding_committed
+                or self._reply_active is not None or self._qrcode
+                or self._active is not None and self._active.operation in {"qr", "poll", "context"}
+                or self._clock() < self._receive_retry_at):
+            return False
+        return self._start("replies", (self._credentials, self._cursor), self._question_updates_ready)
+
+    def _question_updates_ready(self, value):
+        previous_cursor = self._cursor
+        previous_context = self._context
+        was_ready = self._bootstrap_ready
+        self._context_refresh_pending = False
+        self._question_update_deferred = False
+        changed = self._cursor != value.cursor or bool(value.context_token and value.context_token != self._context)
+        self._cursor = value.cursor
+        if value.context_token:
+            self._context = value.context_token
+        if self._questions_enabled:
+            self.question_replies.emit(value.messages, self.question_owner_key())
+        if self._question_update_deferred:
+            self._cursor = previous_cursor
+            self._receive_retry_at = self._clock() + timedelta(seconds=1)
+        if changed:
+            try:
+                # Receive cursor updates are part of the opted-in channel, not
+                # a change to the saved automatic-notification preference.
+                save_config(self.config_path, WeixinConfig(
+                    self._saved_enabled, self._credentials, self._context, self._cursor))
+            except Exception:
+                self._question_fault = True
+                self._bootstrap_ready = False
+                self._question_timer.stop()
+                self.question_transport_error.emit("config_error")
+                return
+        self._bootstrap_ready = True
+        if not was_ready or not previous_context and self._context:
+            self._set_status("微信本人接收通道已就绪，问题发送与接收可以并行。"
+                             if self._context else "微信本人接收已就绪；等待本人消息建立回复上下文。")
+
+    def defer_question_update(self):
+        # The broker could not durably accept a reply. Retain the prior cursor
+        # so the next read can replay it; first-answer/message-id deduplication
+        # protects replies that were already committed in the same batch.
+        self._question_update_deferred = True
+
     def _set_status(self, text):
         self.status_text = text
         self.dialog.status.setText(text)
@@ -330,22 +449,54 @@ class WeixinNotifyController(QObject):
         self.dialog.activateWindow()
 
     def _start(self, operation, arguments, callback, *, auto_notice=None):
-        if not self._interactive_allowed() or self._active is not None:
+        incoming = operation == "replies"
+        if not self._interactive_allowed():
+            return False
+        if incoming:
+            if (self._reply_active is not None or
+                    self._active is not None and self._active.operation in {"qr", "poll", "context"}):
+                return False
+        elif self._active is not None or operation == "context" and self._reply_active is not None:
             return False
         epoch = self._epoch
+        send_epoch = self._send_epoch
+        question_epoch = self._question_epoch
+        def allowed():
+            return (epoch == self._epoch and self._interactive_allowed()
+                    and (self._reply_active is worker if incoming else
+                         self._active is worker and send_epoch == self._send_epoch)
+                    and (operation not in {"replies", "question_send"}
+                         or self._questions_enabled and self._binding_committed
+                         and question_epoch == self._question_epoch))
         worker = self._factory(operation, arguments, parent=self)
         self._workers.add(worker)
-        self._active = worker
-        self._active_auto_notice = auto_notice
-        worker.result_ready.connect(lambda value: callback(value) if epoch == self._epoch
-                                    and self._interactive_allowed() else None)
+        if incoming:
+            self._reply_active = worker
+        else:
+            self._active = worker
+            self._active_auto_notice = auto_notice
+        worker.result_ready.connect(lambda value: callback(value) if allowed() else None)
         worker.error.connect(lambda code: self._job_error(operation, code)
-                             if epoch == self._epoch and self._interactive_allowed() else None)
-        worker.finished.connect(lambda: self._retire(worker))
+                             if allowed() else None)
+        worker.finished.connect(lambda: self._retire_reply(worker) if incoming else self._retire(worker))
         worker.start()
         return True
 
     def _job_error(self, operation, code):
+        if operation == "replies":
+            if code in {"network_error", "poll_connect_timeout", "poll_tls_error", "poll_connection_error"}:
+                # Read-only long polling may time out. This never resends an
+                # outgoing question or applies an answer more than once.
+                self._receive_retry_at = self._clock() + timedelta(seconds=3)
+            else:
+                self._question_fault = True
+                self._bootstrap_ready = False
+                self._context_refresh_pending = False
+                self._question_timer.stop()
+            self.question_transport_error.emit(code)
+            return
+        if operation == "question_send":
+            self.question_send_result.emit(code)
         failed = []
         if operation in {"qr", "poll"}:
             self._poll_timer.stop()  # A failed poll requires an explicit retry.
@@ -358,7 +509,9 @@ class WeixinNotifyController(QObject):
             self._enabled = False
             self._queue.clear()
             self._active_auto_notice = None
-            self._epoch += 1
+            # A rejected outgoing message does not invalidate a concurrent
+            # owner read. Only the sending slot's late callbacks are stale.
+            self._send_epoch += 1
             self.dialog.enabled.setChecked(False)
         self._set_status(_ERRORS.get(code, _ERRORS["bad_response"]))
         if self._interactive_allowed():
@@ -375,18 +528,44 @@ class WeixinNotifyController(QObject):
             self._active = None
             self._active_auto_notice = None
         worker.deleteLater()
+        self._flush_context_refresh()
         self._drain()
+        if self._active is None:
+            self.slot_available.emit()
+
+    def _retire_reply(self, worker):
+        self._workers.discard(worker)
+        if self._reply_active is worker:
+            self._reply_active = None
+        worker.deleteLater()
+        self._flush_context_refresh()
+        self.slot_available.emit()
+
+    def _flush_context_refresh(self):
+        if (not self._context_refresh_pending or not self._interactive_allowed()
+                or self._credentials is None or self._qrcode):
+            return
+        if self._questions_enabled and self._binding_committed:
+            self.poll_question_replies()
+        elif self._reply_active is None and self._active is None:
+            if self._start("context", (self._credentials, self._cursor), self._context_ready):
+                self._context_refresh_pending = False
 
     def _invalidate(self):
         self._epoch += 1
+        self._bootstrap_ready = False
+        self._context_refresh_pending = False
         self._input_watch_started = self._clock()
         self._queue.clear()
         self._active_auto_notice = None
         self._poll_timer.stop()
+        self._question_timer.stop()
         self._qrcode = None
         self.dialog.qr.clear()
         if self._active is not None:
             self._active.cancel()
+        if self._reply_active is not None:
+            self._reply_active.cancel()
 
     def _dialog_closed(self):
         if self._closed:
@@ -411,6 +590,7 @@ class WeixinNotifyController(QObject):
             self._set_status("上一个请求尚未结束，请稍后重新点击扫码登录。")
             return
         self._invalidate()
+        self._binding_committed = False
         self._enabled = False
         self.dialog.enabled.setChecked(False)
         self._set_status("正在请求本次登录二维码……")
@@ -445,8 +625,12 @@ class WeixinNotifyController(QObject):
             self._qr_base = value.poll_base_url
             self._set_status("已扫码，请在本人微信确认登录。" if value.status == "scanned" else "等待本人微信扫码确认……")
         elif value.status == "confirmed" and value.credentials is not None:
+            self._invalidate()
             self._credentials = value.credentials
+            self._binding_committed = False
             self._context = self._cursor = ""
+            self._question_fault = False
+            self._receive_retry_at = self._clock()
             self._qrcode = None
             self._poll_timer.stop()
             self.dialog.qr.clear()
@@ -463,8 +647,14 @@ class WeixinNotifyController(QObject):
         if self._credentials is None:
             self._set_status("请先通过本人微信扫码确认登录。")
             return
-        self._set_status("仅核对扫码本人发来的消息上下文，不执行消息内容……")
-        self._start("context", (self._credentials, self._cursor), self._context_ready)
+        self._context_refresh_pending = True
+        if (self._questions_enabled and self._binding_committed) or self._reply_active is not None:
+            self.retry_question_channel()
+            self._flush_context_refresh()
+            self._set_status("微信问答共用接收通道，正在核对本人上下文。")
+        else:
+            self._set_status("仅核对扫码本人发来的消息上下文，不执行消息内容……")
+            self._flush_context_refresh()
 
     def _context_ready(self, value):
         self._cursor = value.cursor
@@ -491,6 +681,9 @@ class WeixinNotifyController(QObject):
             self._set_status("本机微信设置未能安全保存，提醒保持关闭；没有发送任何测试。")
             return
         self._enabled = enabled
+        self._saved_enabled = enabled
+        self._binding_committed = self._credentials is not None
+        self.set_question_channel(self._questions_enabled)
         self._set_status("微信提醒设置已保存；只处理之后的新事件，不补发旧提醒。" if enabled else "微信提醒已关闭并保存。")
 
     def clear_login(self):
@@ -498,6 +691,8 @@ class WeixinNotifyController(QObject):
             return
         self._invalidate()
         self._enabled = False
+        self._saved_enabled = False
+        self._binding_committed = False
         self._credentials = None
         self._context = self._cursor = ""
         self.dialog.enabled.setChecked(False)
@@ -611,6 +806,7 @@ class WeixinNotifyController(QObject):
             self._set_status("任务跟进已暂停，微信待发提醒已清空；已经在途的请求无法撤回。")
         elif self._interactive_allowed():
             self._set_status("任务跟进已恢复；只等待之后的新事件，不补发旧提醒。")
+            self.set_question_channel(self._questions_enabled)
 
     def set_paused(self, paused):
         if self._closed:
@@ -622,6 +818,7 @@ class WeixinNotifyController(QObject):
             self._set_status("免打扰中：暂停微信请求并清空待发提醒；已经在途的请求无法撤回。")
         elif self._interactive_allowed():
             self._set_status("免打扰已解除；只等待之后的新事件，不补发旧提醒。")
+            self.set_question_channel(self._questions_enabled)
 
     def set_test_mode(self, enabled):
         if self._closed:
@@ -630,6 +827,8 @@ class WeixinNotifyController(QObject):
         self._invalidate()
         self._set_status("测试模式中：暂停微信任务提醒，恢复后不补发。" if self._test_mode
                          else "已退出测试模式；只等待之后的新事件，不补发旧提醒。")
+        if not self._test_mode:
+            self.set_question_channel(self._questions_enabled)
 
     def shutdown(self):
         if self._closed:

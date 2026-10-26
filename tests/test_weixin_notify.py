@@ -126,7 +126,7 @@ class WeixinHTTPTests(unittest.TestCase):
         self.assertNotIn("PRIVATE", repr(update))
         self.assertNotIn("execute", repr(update))
         options = self.session.request.call_args.kwargs
-        self.assertEqual(options["timeout"], 5)
+        self.assertEqual(options["timeout"], 35)
         self.assertEqual(options["json"]["get_updates_buf"], "previous-cursor")
         self.assertEqual(options["json"]["base_info"]["bot_agent"], "NenePet/1.0")
         self.assertEqual(options["headers"]["Authorization"], "Bearer TOKEN-SENTINEL")

@@ -424,6 +424,7 @@ def main() -> int:
     workflow = None
     workflow_weixin = None
     workflow_bark = None
+    workflow_questions = None
     phone_router = None
     if settings.character.profile_id == "nene":
         from aipet.ui.utility_assistant import UtilityController
@@ -432,26 +433,33 @@ def main() -> int:
         from aipet.ui.weixin_notify import WeixinNotifyController
         from aipet.ui.bark_notify import BarkNotifyController
         from aipet.ui.phone_router import PhoneNotificationRouter
+        from aipet.ui.weixin_questions import QuestionChannelController
         utility = UtilityController(pet, parent=app)
         workflow = WorkflowController(pet, parent=app)
         workflow_weixin = WeixinNotifyController(pet, parent=app)
         workflow_bark = BarkNotifyController(pet, parent=app)
+        workflow_questions = QuestionChannelController(pet, workflow_weixin, parent=app)
         phone_router = PhoneNotificationRouter(workflow_weixin, workflow_bark)
         workflow.notification_ready.connect(phone_router.enqueue)
         workflow.tracking_changed.connect(workflow_weixin.set_tracking)
         workflow.tracking_changed.connect(workflow_bark.set_tracking)
+        workflow.tracking_changed.connect(workflow_questions.set_tracking)
         workflow.dialog.weixin.clicked.connect(workflow_weixin.open)
         workflow.dialog.bark.clicked.connect(workflow_bark.open)
+        workflow.dialog.questions.clicked.connect(workflow_questions.open)
         workflow_weixin.status_changed.connect(workflow.dialog.weixin_status.setText)
         workflow.dialog.weixin_status.setText(workflow_weixin.status_text)
         workflow_bark.status_changed.connect(workflow.dialog.bark_status.setText)
         workflow.dialog.bark_status.setText(workflow_bark.status_text)
+        workflow_questions.status_changed.connect(workflow.dialog.questions_status.setText)
+        workflow.dialog.questions_status.setText(workflow_questions.status_text)
         # Controllers start in tracking mode. Preserve their useful loaded
         # binding/disabled status rather than replacing it with "resumed" on
         # ordinary startup. An initially paused workflow still gates both.
         if not workflow._sync_tracking():
             workflow_weixin.set_tracking(False)
             workflow_bark.set_tracking(False)
+            workflow_questions.set_tracking(False)
         workflow_action.triggered.connect(lambda: workflow.open())
         utility_hotkey = UtilityHotkey(parent=app)
         utility_action.triggered.connect(lambda: utility.open())
@@ -700,6 +708,8 @@ def main() -> int:
             phone_router.shutdown()
         if workflow is not None:
             workflow.shutdown()
+        if workflow_questions is not None:
+            workflow_questions.shutdown()
         if workflow_weixin is not None:
             workflow_weixin.shutdown()
         if workflow_bark is not None:
@@ -745,6 +755,8 @@ def main() -> int:
         QTimer.singleShot(0, workflow_weixin.open)
     if workflow_bark is not None and "--nene-open-bark" in sys.argv:
         QTimer.singleShot(0, workflow_bark.open)
+    if workflow_questions is not None and "--nene-open-questions" in sys.argv:
+        QTimer.singleShot(0, workflow_questions.open)
     if "--nene-smoke-ui" in sys.argv:
         pet.show_text("点击人物输入，回车发送。", typing=False)
         QTimer.singleShot(60_000, coordinator.request)

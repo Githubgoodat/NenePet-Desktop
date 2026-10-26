@@ -1,12 +1,15 @@
 """Own-recipient text notices over Tencent's documented iLink protocol.
 
 This is a small local adapter, not an OpenClaw runtime or an agent. Incoming
-message bodies are discarded. API acceptance is never a delivery receipt.
+message bodies are discarded by the default context-only API. The separate
+reply API exposes bounded owner text only to an explicitly enabled caller.
+API acceptance is never a delivery receipt.
 """
 from __future__ import annotations
 
 import base64
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -25,6 +28,10 @@ CHANNEL_VERSION = "2.4.10"
 CLIENT_VERSION = str((2 << 16) | (4 << 8) | 10)
 MAX_RESPONSE_BYTES = 1024 * 1024
 MAX_CONFIG_BYTES = 256 * 1024
+MAX_REPLY_TEXT_CHARS = 2200
+MAX_PROVIDER_MESSAGE_ID_CHARS = 256
+_UINT64_MAX = (1 << 64) - 1
+_MAX_TIMESTAMP_MS = (1 << 53) - 1
 _CONFIG_FORMAT = "nenepet-weixin-notify-v1"
 _IDENTITY = re.compile(r"[A-Za-z0-9_.:@-]{1,256}\Z")
 
@@ -63,6 +70,22 @@ class WeixinUpdate:
     cursor: str
 
 
+@dataclass(frozen=True, repr=False)
+class WeixinIncomingReply:
+    message_id: str
+    text: str
+    # Unix epoch milliseconds (UTC), not a local receipt timestamp. None means
+    # the server omitted it; callers must not invent a freshness guarantee.
+    create_time_ms: int | None = None
+
+
+@dataclass(frozen=True, repr=False)
+class WeixinReplyUpdate:
+    context_token: str | None
+    cursor: str
+    messages: tuple[WeixinIncomingReply, ...] = ()
+
+
 @dataclass(frozen=True)
 class WeixinSendResult:
     accepted: bool
@@ -81,6 +104,68 @@ def _text(value, maximum: int, *, empty: bool = False) -> str:
             or not empty and not value or any(not c.isprintable() for c in value)):
         raise WeixinNotifyError("bad_response")
     return value
+
+
+def _reply_message_id(value) -> str | None:
+    """Canonical, bounded replay key shared by top-level and item IDs.
+
+    Tencent's getWeixinMessageId also accepts an opaque item.msg_id when the
+    optional top-level ID is absent. Numeric wire IDs retain their previous
+    decimal form; opaque IDs use a separate hashed namespace, so a provider
+    string resembling our own prefix cannot impersonate another replay key.
+    """
+    if type(value) is int:
+        return str(value) if 0 < value <= _UINT64_MAX else None
+    if (not isinstance(value, str) or not 0 < len(value) <= MAX_PROVIDER_MESSAGE_ID_CHARS
+            or any(not char.isprintable() for char in value)):
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    if value.isdecimal():
+        if not re.fullmatch(r"[1-9][0-9]{0,19}", value) or int(value) > _UINT64_MAX:
+            return None
+        return value
+    # Numeric JSON values are never coerced from bool/float, and signed numeric
+    # sentinels are not promoted into otherwise valid opaque identifiers.
+    if re.fullmatch(r"[+-][0-9]+", value):
+        return None
+    return "weixin-id-sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _incoming_reply(message: dict) -> WeixinIncomingReply | None:
+    """Project one plain-text item; quoted/forwarded content is never read."""
+    items = message.get("item_list")
+    if not isinstance(items, list) or len(items) != 1:
+        return None
+    item = items[0]
+    if (not isinstance(item, dict) or type(item.get("type")) is not int or item["type"] != 1
+            or any(item.get(field) is not None for field in (
+                "image_item", "voice_item", "file_item", "video_item",
+                "tool_call_start_item", "tool_call_result_item",
+            ))):
+        return None
+    identity = message.get("message_id")
+    # Fall back only for an absent/empty top-level field, not for a malformed
+    # supplied ID. Inspect only the validated top-level text item, never a
+    # quoted item's ID, seq, client_id, timestamp or freshly generated value.
+    if (identity is None or identity == "" or isinstance(identity, str)
+            and len(identity) <= MAX_PROVIDER_MESSAGE_ID_CHARS and not identity.strip(" ")):
+        identity = item.get("msg_id")
+    identity = _reply_message_id(identity)
+    if identity is None:
+        return None
+    text_item = item.get("text_item")
+    text = text_item.get("text") if isinstance(text_item, dict) else None
+    if (not isinstance(text, str) or not text.strip() or len(text) > MAX_REPLY_TEXT_CHARS
+            or any(not char.isprintable() and char not in "\r\n\t" for char in text)):
+        return None
+    created = message.get("create_time_ms")
+    if created is not None and (type(created) is not int or not 0 <= created <= _MAX_TIMESTAMP_MS):
+        # Provider time is optional metadata, not proof of freshness or owner
+        # authority. Preserve otherwise valid text when it is unusable.
+        created = None
+    return WeixinIncomingReply(identity, text, created)
 
 
 def _base_url(value: str) -> str:
@@ -156,8 +241,9 @@ class WeixinClient:
         if token is not None:
             headers["Authorization"] = "Bearer " + token
         response = None
-        timeout = 5 if long_poll else 8
+        timeout = 35 if long_poll else 8
         deadline = time.monotonic() + timeout
+        error_code = None
         try:
             response = self.session.request(method, base_url + "/" + endpoint, headers=headers,
                 params=params, json=body, timeout=timeout, allow_redirects=False, stream=True)
@@ -180,20 +266,37 @@ class WeixinClient:
                 raise WeixinNotifyError("bad_response")
             _business(data)
             return data
-        except WeixinNotifyError:
-            raise
+        except WeixinNotifyError as exc:
+            error_code = exc.code
+        except requests.ReadTimeout:
+            if long_poll:
+                # An idle read poll is normal. Omitting the next cursor lets
+                # _update_batch keep the caller's previous cursor verbatim.
+                return {"ret": 0, "msgs": []}
+            error_code = "network_error"
+        except requests.ConnectTimeout:
+            error_code = "poll_connect_timeout" if long_poll else "network_error"
+        except requests.exceptions.SSLError:
+            error_code = "poll_tls_error" if long_poll else "network_error"
+        except requests.ConnectionError:
+            error_code = "poll_connection_error" if long_poll else "network_error"
         except (requests.RequestException, OSError):
-            raise WeixinNotifyError("network_error") from None
+            error_code = "network_error"
         except (ValueError, TypeError, UnicodeError, RecursionError):
-            raise WeixinNotifyError("bad_response") from None
+            error_code = "bad_response"
         except Exception:
-            raise WeixinNotifyError("network_error") from None
+            error_code = "network_error"
         finally:
             if response is not None:
                 try:
                     response.close()
                 except Exception:
                     pass
+        # Raise outside the handler so neither the HTTP exception nor its
+        # prepared request (which may contain credentials) is retained as the
+        # fixed diagnostic's exception context.
+        if error_code is not None:
+            raise WeixinNotifyError(error_code)
 
     def request_qr(self) -> WeixinQRCode:
         data = self._request("POST", DEFAULT_BASE_URL, "ilink/bot/get_bot_qrcode",
@@ -223,8 +326,7 @@ class WeixinClient:
             raise WeixinNotifyError("bad_response")
         return WeixinQRResult(statuses[status], base_url)
 
-    def get_updates(self, credentials: WeixinCredentials, cursor: str = "") -> WeixinUpdate:
-        credentials = _credentials(credentials)
+    def _update_batch(self, credentials: WeixinCredentials, cursor: str) -> tuple[list, str]:
         cursor = _text(cursor, 65536, empty=True)
         data = self._request("POST", credentials.base_url, "ilink/bot/getupdates", token=credentials.bot_token,
                              body={"get_updates_buf": cursor, "base_info": _base_info()}, long_poll=True)
@@ -235,6 +337,12 @@ class WeixinClient:
         messages = data.get("msgs", [])
         if not isinstance(messages, list):
             raise WeixinNotifyError("bad_response")
+        return messages, next_cursor
+
+    def get_updates(self, credentials: WeixinCredentials, cursor: str = "") -> WeixinUpdate:
+        """Legacy context refresh: never returns or retains message bodies."""
+        credentials = _credentials(credentials)
+        messages, next_cursor = self._update_batch(credentials, cursor)
         context = None
         for message in messages:
             if (isinstance(message, dict) and message.get("from_user_id") == credentials.scanner_id
@@ -242,6 +350,30 @@ class WeixinClient:
                     and not message.get("group_id") and message.get("context_token")):
                 context = _text(message["context_token"], 16384)
         return WeixinUpdate(context, next_cursor)
+
+    def get_reply_updates(self, credentials: WeixinCredentials, cursor: str = "") -> WeixinReplyUpdate:
+        """One poll for owner-only text; does not route, execute, approve or save.
+
+        Only one top-level text item is accepted. Multiple text items and mixed
+        media are rejected, rather than concatenated. Optional ref_msg content
+        is ignored; only the owner's new top-level text is returned. A caller
+        must explicitly correlate and deduplicate replies before using them.
+        """
+        credentials = _credentials(credentials)
+        messages, next_cursor = self._update_batch(credentials, cursor)
+        context, replies = None, []
+        for message in messages:
+            if (not isinstance(message, dict) or message.get("from_user_id") != credentials.scanner_id
+                    or type(message.get("message_type")) is not int or message["message_type"] != 1
+                    or message.get("group_id") not in (None, "")
+                    or message.get("to_user_id") not in (None, "", credentials.bot_id)):
+                continue
+            if message.get("context_token"):
+                context = _text(message["context_token"], 16384)
+            reply = _incoming_reply(message)
+            if reply is not None:
+                replies.append(reply)
+        return WeixinReplyUpdate(context, next_cursor, tuple(replies))
 
     def send_notice(self, credentials: WeixinCredentials, context_token: str, text: str) -> WeixinSendResult:
         credentials = _credentials(credentials)
