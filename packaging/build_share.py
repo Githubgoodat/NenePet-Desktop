@@ -56,6 +56,7 @@ def create_source(destination: Path) -> None:
         "packaging/build_voice_bundle.py",
         "README.md", "CREDITS.md", "docs/LOCAL_ASSETS.md", ".gitignore",
         "docs/WORKFLOW.md", "tools/nene_workflow_hook.py", "tools/nene_workflow_event.py",
+        "docs/AUTOSTART.md", "tools/manage_autostart.py",
         "tools/prepare_codex_workflow.py",
         "licenses/font/LICENSE-Apache-2.0.txt", "licenses/font/font-name-table.json",
         "licenses/weixin/LICENSE-Tencent-MIT.txt",

@@ -420,6 +420,9 @@ def main() -> int:
     utility_action.setVisible(settings.character.profile_id == "nene")
     workflow_action = QAction(tray_menu)
     workflow_action.setVisible(settings.character.profile_id == "nene")
+    from aipet.ui.autostart import create_autostart_action
+    autostart_action = create_autostart_action(tray_menu)
+    tray_menu.aboutToShow.connect(autostart_action.refresh_status)
     utility = utility_hotkey = None
     workflow = None
     workflow_weixin = None
@@ -478,6 +481,8 @@ def main() -> int:
         utility_action.setVisible(current_settings.character.profile_id == "nene")
         workflow_action.setText("AI task tracking…" if current_settings.ui_language == "en" else "AI任务跟进…")
         workflow_action.setVisible(current_settings.character.profile_id == "nene")
+        autostart_action.setText("Start with Windows" if current_settings.ui_language == "en" else "开机启动")
+        autostart_action.setVisible(sys.platform == "win32" and current_settings.character.profile_id == "nene")
         settings_action.setText(ui_text(current_settings, "settings"))
         dnd_action.setText(ui_text(current_settings, "dnd"))
         screenshot_action.setText(ui_text(current_settings, "vision"))
@@ -492,6 +497,7 @@ def main() -> int:
     tray_menu.addAction(utility_action)
     tray_menu.addAction(workflow_action)
     tray_menu.addAction(settings_action)
+    tray_menu.addAction(autostart_action)
     tray_menu.addSeparator()
     tray_menu.addAction(dnd_action)
     tray_menu.addAction(test_action)
